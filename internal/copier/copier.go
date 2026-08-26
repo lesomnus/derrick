@@ -59,6 +59,11 @@ type Copier struct {
 	// than for releases.
 	NoReferrers bool
 
+	// CosignTags is how hard to look for artifacts attached the way cosign v2
+	// attached them, by a tag named after the subject digest: CosignTagsRoot
+	// (the default), CosignTagsAll or CosignTagsNone.
+	CosignTags string
+
 	// Verify re-reads every object after writing and checks it is the size and
 	// shape that was intended.
 	Verify bool

@@ -14,6 +14,25 @@ import (
 // abuse rather than a release.
 const maxReferrerRounds = 8
 
+// How hard to look for cosign's fallback tags.
+const (
+	// CosignTagsRoot probes only the manifest being published. This is the
+	// default because `cosign sign <ref>` signs what the reference resolves
+	// to, and that is the manifest being published.
+	CosignTagsRoot = "root"
+
+	// CosignTagsAll probes every manifest in the graph, which is what a
+	// `cosign sign --recursive` over a multi-architecture image produces. It
+	// costs three requests per manifest, almost all of which are misses, and
+	// on a large index that is enough to trip a registry's rate limit.
+	CosignTagsAll = "all"
+
+	// CosignTagsNone skips the fallback entirely, leaving only the referrers
+	// API. Safe when everything is signed by cosign v3 against a registry that
+	// implements referrers.
+	CosignTagsNone = "none"
+)
+
 // Plan is everything a copy will write, in the order it has to be written.
 //
 // The order is the whole point. Blobs land before any manifest that names
@@ -63,11 +82,24 @@ type planner struct {
 	seenBlobs     map[string]bool
 	log           Logger
 	withReferrers bool
+	cosignTags    string
+	root          string
 }
 
 // Plan walks the source image and everything attached to it, and returns what
 // needs to be written.
 func (c *Copier) Plan(ctx context.Context, root *source.Manifest, tag string) (*Plan, error) {
+	cosignTags := c.CosignTags
+	if cosignTags == "" {
+		cosignTags = CosignTagsRoot
+	}
+	switch cosignTags {
+	case CosignTagsRoot, CosignTagsAll, CosignTagsNone:
+	default:
+		return nil, fmt.Errorf("cosign-tags must be %q, %q or %q, not %q",
+			CosignTagsRoot, CosignTagsAll, CosignTagsNone, cosignTags)
+	}
+
 	p := &planner{
 		src:           c.Source,
 		plan:          &Plan{},
@@ -75,6 +107,8 @@ func (c *Copier) Plan(ctx context.Context, root *source.Manifest, tag string) (*
 		seenBlobs:     map[string]bool{},
 		log:           c.logger(),
 		withReferrers: !c.NoReferrers,
+		cosignTags:    cosignTags,
+		root:          root.Digest,
 	}
 
 	if err := p.visit(ctx, root); err != nil {
@@ -175,6 +209,10 @@ func (p *planner) collectAttachments(ctx context.Context) error {
 				found = true
 			}
 
+			if !p.probeCosignTags(subject) {
+				continue
+			}
+
 			for _, tag := range source.CosignTags(subject) {
 				m, ok, err := p.src.ManifestByTag(ctx, tag)
 				if err != nil {
@@ -205,6 +243,19 @@ func (p *planner) collectAttachments(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("referrer chain did not settle after %d rounds", maxReferrerRounds)
+}
+
+// probeCosignTags reports whether the fallback tags are worth asking about for
+// this subject.
+func (p *planner) probeCosignTags(subject string) bool {
+	switch p.cosignTags {
+	case CosignTagsNone:
+		return false
+	case CosignTagsAll:
+		return true
+	default:
+		return subject == p.root
+	}
 }
 
 func (p *planner) taggedAlready(tag string) bool {

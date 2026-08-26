@@ -31,6 +31,13 @@ Everything reachable from the image:
 - every manifest, including each architecture of a multi-architecture index
 - signatures, attestations and SBOMs, found **both** through the referrers API
   and through the `sha256-<digest>.sig` tags cosign falls back to
+
+By default the fallback tags are only looked for on the manifest being
+published, because that is what `cosign sign <ref>` signs. Probing them costs
+three requests per subject and nearly all of them miss, so asking about every
+manifest in a large index is enough on its own to trip a registry's rate limit.
+`--cosign-tags=all` asks about all of them, which is what a
+`cosign sign --recursive` over a multi-architecture image needs.
 - the referrer descriptor objects that let the registry answer the referrers
   API, so `cosign verify` finds what it is looking for
 
@@ -79,6 +86,7 @@ derrick version
 | `--dry-run` | plan and report, write nothing |
 | `--verify` | re-read every object after writing it |
 | `--no-referrers` | skip signatures and attestations (debugging only) |
+| `--cosign-tags` | how hard to look for cosign's fallback tags: `root` (default), `all`, `none` |
 | `--src-insecure` | allow a plain-http source registry |
 | `--quiet` | only report the outcome |
 
@@ -134,9 +142,13 @@ The layout, ordering and referrer rules are covered by unit tests, and the read
 side runs end to end in `go test` against a registry started in-process:
 images, multi-architecture indexes, republishing, and moving a tag.
 
-**The S3 write path has not been exercised against a live bucket.** Everything
-above stores into an in-memory implementation of the same interface, so what is
-still unproven is the SDK configuration — multipart uploads, endpoint and
-path-style addressing, and the checksum headers R2 rejects. Try it with
-`--dry-run` and then against a throwaway repository before putting derrick on a
-release path.
+The whole path has been run once for real: a signed multi-architecture image
+copied from `cgr.dev` into a Cloudflare R2 bucket, then pulled back out through
+a deployed serverless-registry and checked with `validate.Index`, which
+verifies every manifest, layer and diffID. The cosign signature and attestation
+came across with it and resolve by their fallback tags.
+
+Still unexercised: **layers large enough to go multipart**. The largest blob in
+that test was 600 KB, well under the uploader's part size, so the multipart
+path has not actually run against R2. That is the next thing to try, and it is
+the one most likely to surface a checksum-header problem.

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 
 	"github.com/lesomnus/derrick/internal/blobstore"
@@ -83,6 +84,55 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 
+// reorder moves flags ahead of positional arguments.
+//
+// Go's flag package stops parsing at the first non-flag argument, so
+// `derrick copy src dst --endpoint …` would silently ignore the endpoint. That
+// is the order everyone writes a copy in, so accept it: pull the flags out,
+// taking the value with each one that has a separate value, and hand the rest
+// back as positionals.
+func reorder(fs *flag.FlagSet, args []string) []string {
+	var flags, positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+
+			break
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			positional = append(positional, arg)
+
+			continue
+		}
+
+		name, value, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		flags = append(flags, arg)
+		if hasValue {
+			_ = value
+
+			continue
+		}
+
+		// A flag that takes a value and did not carry one inline consumes the
+		// next argument. Booleans do not, which is what IsBoolFlag reports.
+		found := fs.Lookup(name)
+		if found == nil {
+			continue
+		}
+		if boolFlag, ok := found.Value.(interface{ IsBoolFlag() bool }); ok && boolFlag.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+
+	return append(flags, positional...)
+}
+
 type storeFlags struct {
 	endpoint    string
 	region      string
@@ -111,13 +161,14 @@ func runCopy(ctx context.Context, args []string) error {
 		dryRun      = fs.Bool("dry-run", false, "report what would be written without writing it")
 		noReferrers = fs.Bool("no-referrers", false, "skip signatures, attestations and SBOMs")
 		doVerify    = fs.Bool("verify", false, "re-read every object after writing it")
+		cosignTags  = fs.String("cosign-tags", copier.CosignTagsRoot, `how hard to look for cosign's fallback tags: "root", "all" or "none"`)
 		insecure    = fs.Bool("src-insecure", false, "allow a plain-http source registry")
 		quiet       = fs.Bool("quiet", false, "only report the outcome")
 	)
 	store.bind(fs)
 	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorder(fs, args)); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
@@ -151,6 +202,7 @@ func runCopy(ctx context.Context, args []string) error {
 		Concurrency: store.concurrency,
 		DryRun:      *dryRun,
 		NoReferrers: *noReferrers,
+		CosignTags:  *cosignTags,
 		Verify:      *doVerify,
 		Log:         log,
 	}
@@ -180,7 +232,7 @@ func runVerify(ctx context.Context, args []string) error {
 	store.bind(fs)
 	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorder(fs, args)); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {

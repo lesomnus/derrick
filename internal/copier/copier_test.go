@@ -462,3 +462,91 @@ func TestValidate(t *testing.T) {
 		t.Errorf("ValidateTag: %v", err)
 	}
 }
+
+// Probing cosign's fallback tags costs three requests per subject and almost
+// all of them miss, so by default only the manifest being published is asked
+// about. On a large index the difference is enough to trip a registry's rate
+// limit.
+func TestCosignTagScope(t *testing.T) {
+	build := func(t *testing.T) (*fakeSource, *source.Manifest, *source.Manifest) {
+		t.Helper()
+
+		src := newFakeSource()
+		child := src.image(t, "child-layer")
+		index := src.addManifest(t, layout.Manifest{
+			MediaType: "application/vnd.oci.image.index.v1+json",
+			Manifests: []layout.Descriptor{
+				{MediaType: child.MediaType, Digest: child.Digest, Size: child.Size},
+			},
+		})
+
+		// Attached to the child, which is the case only --cosign-tags=all finds.
+		sigConfig := src.addBlob(t, "application/vnd.oci.empty.v1+json", "{}")
+		signature := src.addManifest(t, layout.Manifest{
+			MediaType: "application/vnd.oci.image.manifest.v1+json",
+			Config:    &sigConfig,
+		})
+		src.byTag[source.CosignTags(child.Digest)[0]] = signature
+
+		return src, index, signature
+	}
+
+	t.Run("root only, by default", func(t *testing.T) {
+		src, index, signature := build(t)
+		store := blobstore.NewMemory()
+
+		c := &copier.Copier{Source: src, Store: store, Repository: repository}
+		if _, err := c.Run(context.Background(), index, "1.4.2"); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		if _, ok := store.Body(layout.ManifestKey(repository, signature.Digest)); ok {
+			t.Error("the default scope reached past the root")
+		}
+	})
+
+	t.Run("all", func(t *testing.T) {
+		src, index, signature := build(t)
+		store := blobstore.NewMemory()
+
+		c := &copier.Copier{
+			Source: src, Store: store, Repository: repository,
+			CosignTags: copier.CosignTagsAll,
+		}
+		if _, err := c.Run(context.Background(), index, "1.4.2"); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		if _, ok := store.Body(layout.ManifestKey(repository, signature.Digest)); !ok {
+			t.Errorf("--cosign-tags=all missed a signature attached to a child; stored: %v", store.Keys())
+		}
+	})
+
+	t.Run("none", func(t *testing.T) {
+		src, index, _ := build(t)
+		store := blobstore.NewMemory()
+
+		c := &copier.Copier{
+			Source: src, Store: store, Repository: repository,
+			CosignTags: copier.CosignTagsNone,
+		}
+		result, err := c.Run(context.Background(), index, "1.4.2")
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(result.Plan.Tags) != 1 {
+			t.Errorf("Plan.Tags has %d entries, want only the requested tag", len(result.Plan.Tags))
+		}
+	})
+
+	t.Run("rejects an unknown scope", func(t *testing.T) {
+		src, index, _ := build(t)
+		c := &copier.Copier{
+			Source: src, Store: blobstore.NewMemory(), Repository: repository,
+			CosignTags: "sometimes",
+		}
+		if _, err := c.Run(context.Background(), index, "1.4.2"); err == nil {
+			t.Error("an unknown scope was accepted")
+		}
+	})
+}
