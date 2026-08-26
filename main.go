@@ -1,0 +1,262 @@
+// Command derrick copies container images from a registry into an
+// S3-compatible bucket laid out for serverless-registry to serve.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"syscall"
+
+	"github.com/lesomnus/derrick/internal/blobstore"
+	"github.com/lesomnus/derrick/internal/copier"
+	"github.com/lesomnus/derrick/internal/source"
+	"github.com/lesomnus/derrick/internal/target"
+	"github.com/lesomnus/derrick/internal/verify"
+)
+
+const usage = `derrick copies container images into a serverless-registry bucket.
+
+usage:
+  derrick copy [flags] <source-image> s3://<bucket>/<repository>:<tag>
+  derrick verify [flags] s3://<bucket>/<repository>:<tag>
+  derrick version
+
+Signatures, attestations and SBOMs attached to the image are copied with it,
+found through the referrers API and through the tags cosign falls back to.
+
+Credentials come from the environment: AWS_ACCESS_KEY_ID and
+AWS_SECRET_ACCESS_KEY for the bucket, and the ambient docker login for the
+source registry.
+
+examples:
+  derrick copy registry.internal/perception:1.4.2 \
+    s3://registry-hday-io/robot/perception:1.4.2 \
+    --endpoint https://<account>.r2.cloudflarestorage.com
+
+  derrick verify s3://registry-hday-io/robot/perception:1.4.2 \
+    --endpoint https://<account>.r2.cloudflarestorage.com
+`
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, os.Args[1:]); err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "derrick: interrupted")
+			os.Exit(130)
+		}
+		fmt.Fprintf(os.Stderr, "derrick: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		fmt.Print(usage)
+
+		return errors.New("no command given")
+	}
+
+	switch args[0] {
+	case "copy":
+		return runCopy(ctx, args[1:])
+	case "verify":
+		return runVerify(ctx, args[1:])
+	case "version":
+		fmt.Println(version())
+
+		return nil
+	case "help", "-h", "--help":
+		fmt.Print(usage)
+
+		return nil
+	default:
+		fmt.Print(usage)
+
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+type storeFlags struct {
+	endpoint    string
+	region      string
+	concurrency int
+}
+
+func (f *storeFlags) bind(fs *flag.FlagSet) {
+	fs.StringVar(&f.endpoint, "endpoint", "", "S3 endpoint of the bucket, for example https://<account>.r2.cloudflarestorage.com")
+	fs.StringVar(&f.region, "region", "auto", "S3 region")
+	fs.IntVar(&f.concurrency, "concurrency", 4, "how many objects to transfer at once")
+}
+
+func (f *storeFlags) open(ctx context.Context, bucket string) (blobstore.Store, error) {
+	return blobstore.NewS3(ctx, blobstore.S3Config{
+		Bucket:      bucket,
+		Endpoint:    f.endpoint,
+		Region:      f.region,
+		Concurrency: f.concurrency,
+	})
+}
+
+func runCopy(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("copy", flag.ContinueOnError)
+	var (
+		store       storeFlags
+		dryRun      = fs.Bool("dry-run", false, "report what would be written without writing it")
+		noReferrers = fs.Bool("no-referrers", false, "skip signatures, attestations and SBOMs")
+		doVerify    = fs.Bool("verify", false, "re-read every object after writing it")
+		insecure    = fs.Bool("src-insecure", false, "allow a plain-http source registry")
+		quiet       = fs.Bool("quiet", false, "only report the outcome")
+	)
+	store.bind(fs)
+	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		fs.Usage()
+
+		return errors.New("copy takes a source image and a destination")
+	}
+
+	dst, err := target.Parse(fs.Arg(1))
+	if err != nil {
+		return err
+	}
+
+	log := logger(*quiet)
+
+	src, root, err := source.Open(ctx, fs.Arg(0), source.Options{Insecure: *insecure})
+	if err != nil {
+		return err
+	}
+	log("resolved %s to %s", fs.Arg(0), root.Digest)
+
+	st, err := store.open(ctx, dst.Bucket)
+	if err != nil {
+		return err
+	}
+
+	c := &copier.Copier{
+		Source:      src,
+		Store:       st,
+		Repository:  dst.Repository,
+		Concurrency: store.concurrency,
+		DryRun:      *dryRun,
+		NoReferrers: *noReferrers,
+		Verify:      *doVerify,
+		Log:         log,
+	}
+
+	result, err := c.Run(ctx, root, dst.Tag)
+	if err != nil {
+		return err
+	}
+
+	verb := "published"
+	if *dryRun {
+		verb = "would publish"
+	}
+	fmt.Printf("%s %s at %s\n", verb, dst, root.Digest)
+	fmt.Printf("  blobs      %d uploaded, %d already present (%s)\n",
+		result.BlobsUploaded, result.BlobsSkipped, humanBytes(result.BytesUploaded))
+	fmt.Printf("  manifests  %d written, %d already present\n", result.ManifestsWritten, result.ManifestsSkipped)
+	fmt.Printf("  referrers  %d\n", result.ReferrersWritten)
+	fmt.Printf("  tags       %d\n", result.TagsWritten)
+
+	return nil
+}
+
+func runVerify(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	var store storeFlags
+	store.bind(fs)
+	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+
+		return errors.New("verify takes a destination")
+	}
+
+	ref, err := target.Parse(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	st, err := store.open(ctx, ref.Bucket)
+	if err != nil {
+		return err
+	}
+
+	v := &verify.Verifier{
+		Store:      st,
+		Repository: ref.Repository,
+	}
+
+	report, err := v.Tag(ctx, ref.Tag)
+	if err != nil {
+		return err
+	}
+
+	if !report.OK() {
+		fmt.Printf("%s is not servable\n", ref)
+		for _, problem := range report.Problems {
+			fmt.Printf("  - %s\n", problem)
+		}
+
+		return fmt.Errorf("%d problems", len(report.Problems))
+	}
+
+	fmt.Printf("%s is complete at %s\n", ref, report.Digest)
+	fmt.Printf("  %d manifests, %d blobs, %d referrers\n", report.Manifests, report.Blobs, report.Referrers)
+
+	return nil
+}
+
+func logger(quiet bool) func(string, ...any) {
+	if quiet {
+		return func(string, ...any) {}
+	}
+
+	return func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+
+	div, exp := int64(unit), 0
+	for size := n / unit; size >= unit; size /= unit {
+		div *= unit
+		exp++
+	}
+
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func version() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	if info.Main.Version != "" {
+		return info.Main.Version
+	}
+
+	return "devel"
+}
