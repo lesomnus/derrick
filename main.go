@@ -235,7 +235,7 @@ func runCopy(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("%s %s at %s\n", verb, dst, root.Digest)
 	fmt.Printf("  blobs      %d uploaded, %d already present (%s)\n",
-		result.BlobsUploaded, result.BlobsSkipped, humanBytes(result.BytesUploaded))
+		result.BlobsUploaded, result.BlobsSkipped, copier.HumanBytes(result.BytesUploaded))
 	fmt.Printf("  manifests  %d written, %d already present\n", result.ManifestsWritten, result.ManifestsSkipped)
 	fmt.Printf("  referrers  %d\n", result.ReferrersWritten)
 	fmt.Printf("  tags       %d\n", result.TagsWritten)
@@ -398,7 +398,7 @@ func runMirror(ctx context.Context, args []string) error {
 	fmt.Printf("%s %s into %s%s\n", verb, fs.Arg(0), target.Scheme, bucket)
 	fmt.Printf("  repositories  %d\n", result.Repositories)
 	fmt.Printf("  tags          %d\n", result.Tags)
-	fmt.Printf("  copied        %d (%d blobs, %s)\n", result.Copied, result.BlobsUploaded, humanBytes(result.BytesUploaded))
+	fmt.Printf("  copied        %d (%d blobs, %s)\n", result.Copied, result.BlobsUploaded, copier.HumanBytes(result.BytesUploaded))
 	fmt.Printf("  skipped       %d\n", result.Skipped)
 	fmt.Printf("  excluded      %d\n", result.Excluded)
 	if result.Vanished > 0 {
@@ -537,21 +537,6 @@ func logger(quiet bool) func(string, ...any) {
 	return func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-
-	div, exp := int64(unit), 0
-	for size := n / unit; size >= unit; size /= unit {
-		div *= unit
-		exp++
-	}
-
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func version() string {

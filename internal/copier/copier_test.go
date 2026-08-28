@@ -550,3 +550,108 @@ func TestCosignTagScope(t *testing.T) {
 		}
 	})
 }
+
+// What the log says is what an operator reads while a fleet waits, so it is
+// worth pinning: every blob accounts for itself, whether or not it moved.
+func TestTheLogAccountsForEveryBlob(t *testing.T) {
+	src := newFakeSource()
+	store := blobstore.NewMemory()
+
+	root := src.image(t, "layer-one", "layer-two")
+	src.byTag["1.4.2"] = root
+
+	var lines []string
+	newCopier := func() *copier.Copier {
+		return &copier.Copier{
+			Source:     src,
+			Store:      store,
+			Repository: repository,
+			Log:        func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) },
+		}
+	}
+
+	if _, err := newCopier().Run(context.Background(), root, "1.4.2"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	uploaded := count(lines, "uploaded in")
+	if uploaded != 3 {
+		t.Errorf("the first copy reported %d uploads, want 3 (a config and two layers):\n%s", uploaded, strings.Join(lines, "\n"))
+	}
+	if got := count(lines, " present"); got != 0 {
+		t.Errorf("the first copy reported %d objects already present, want 0", got)
+	}
+
+	lines = nil
+	if _, err := newCopier().Run(context.Background(), root, "1.4.2"); err != nil {
+		t.Fatalf("Run again: %v", err)
+	}
+
+	// The point of saying so: a re-run that copies nothing should look like a
+	// re-run that copied nothing, not like one that did not happen.
+	if got := count(lines, "uploaded in"); got != 0 {
+		t.Errorf("the second copy uploaded %d blobs, want 0:\n%s", got, strings.Join(lines, "\n"))
+	}
+	if got := count(lines, "blob sha256:"); got != 3 {
+		t.Errorf("the second copy accounted for %d blobs, want 3:\n%s", got, strings.Join(lines, "\n"))
+	}
+	if got := count(lines, " present"); got < 3 {
+		t.Errorf("the second copy reported %d objects already present, want at least the 3 blobs:\n%s", got, strings.Join(lines, "\n"))
+	}
+}
+
+func TestADryRunSaysItWouldUpload(t *testing.T) {
+	src := newFakeSource()
+	store := blobstore.NewMemory()
+
+	root := src.image(t, "layer-one")
+	src.byTag["1.4.2"] = root
+
+	var lines []string
+	c := &copier.Copier{
+		Source:     src,
+		Store:      store,
+		Repository: repository,
+		DryRun:     true,
+		Log:        func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) },
+	}
+	if _, err := c.Run(context.Background(), root, "1.4.2"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := count(lines, "would upload"); got != 2 {
+		t.Errorf("a dry run reported %d blobs it would upload, want 2:\n%s", got, strings.Join(lines, "\n"))
+	}
+	if got := count(lines, "uploaded in"); got != 0 {
+		t.Errorf("a dry run claimed to have uploaded %d blobs", got)
+	}
+}
+
+func count(lines []string, substring string) int {
+	n := 0
+	for _, line := range lines {
+		if strings.Contains(line, substring) {
+			n++
+		}
+	}
+
+	return n
+}
+
+func TestHumanBytes(t *testing.T) {
+	for _, tc := range []struct {
+		in   int64
+		want string
+	}{
+		{in: 0, want: "0 B"},
+		{in: 512, want: "512 B"},
+		{in: 1024, want: "1.0 KiB"},
+		{in: 1536, want: "1.5 KiB"},
+		{in: 1024 * 1024, want: "1.0 MiB"},
+		{in: 3 * 1024 * 1024 * 1024, want: "3.0 GiB"},
+	} {
+		if got := copier.HumanBytes(tc.in); got != tc.want {
+			t.Errorf("HumanBytes(%d) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

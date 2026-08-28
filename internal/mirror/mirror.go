@@ -309,6 +309,13 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		return outcome{vanished: true}
 	}
 
+	// Everything the copier logs is prefixed with the tag it is copying. A
+	// mirror has several copies in flight, and an interleaved log of bare
+	// digests says nothing about which image is slow or which one is stuck.
+	logTag := func(format string, args ...any) {
+		log("%s:%s "+format, append([]any{repository, tag}, args...)...)
+	}
+
 	c := &copier.Copier{
 		Source:      repo,
 		Store:       m.Store,
@@ -318,16 +325,18 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		NoReferrers: m.NoReferrers,
 		CosignTags:  m.CosignTags,
 		Verify:      m.Verify,
-		Log:         func(string, ...any) {},
+		Log:         logTag,
 	}
 
+	start := time.Now()
 	copied, err := c.Run(ctx, root, tag)
 	if err != nil {
 		return outcome{err: err}
 	}
 
-	log("%s:%s copied at %s (%d blobs, %d already present)",
-		repository, tag, root.Digest, copied.BlobsUploaded, copied.BlobsSkipped)
+	logTag("copied at %s in %s (%d blobs %s uploaded, %d already present)",
+		root.Digest, time.Since(start).Round(time.Millisecond),
+		copied.BlobsUploaded, copier.HumanBytes(copied.BytesUploaded), copied.BlobsSkipped)
 
 	// The digest recorded is the manifest that was actually copied, not the
 	// one the HEAD above reported. They differ when the tag moved in between,

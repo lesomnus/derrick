@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lesomnus/derrick/internal/blobstore"
 	"github.com/lesomnus/derrick/internal/layout"
@@ -178,6 +179,8 @@ func (c *Copier) Run(ctx context.Context, root *source.Manifest, tag string) (*R
 func (c *Copier) copyBlob(ctx context.Context, blob layout.Descriptor) (bool, error) {
 	key := layout.BlobKey(c.Repository, blob.Digest)
 
+	log := c.logger()
+
 	// Blobs are content-addressed, so an object already at this key is already
 	// the right bytes. Across releases of the same image this skips nearly
 	// everything, which is what makes republishing cheap.
@@ -186,14 +189,17 @@ func (c *Copier) copyBlob(ctx context.Context, blob layout.Descriptor) (bool, er
 		return false, err
 	}
 	if existing != nil && existing.Size == blob.Size {
+		log("blob %s %s present", blob.Digest, HumanBytes(blob.Size))
+
 		return false, nil
 	}
 	if existing != nil {
-		c.logger()("re-uploading %s: stored size %d does not match %d", blob.Digest, existing.Size, blob.Size)
+		log("re-uploading %s: stored size %d does not match %d", blob.Digest, existing.Size, blob.Size)
 	}
 
-	c.logger()("blob %s (%d bytes)", blob.Digest, blob.Size)
 	if c.DryRun {
+		log("blob %s %s would upload", blob.Digest, HumanBytes(blob.Size))
+
 		return true, nil
 	}
 
@@ -205,9 +211,18 @@ func (c *Copier) copyBlob(ctx context.Context, blob layout.Descriptor) (bool, er
 	}
 	defer rc.Close()
 
+	// Timed around the transfer rather than around the whole function, so what
+	// is reported is what a layer cost to move. A slow bucket and a slow
+	// source registry look the same in a total; they do not look the same
+	// against the size of the blob that took the time.
+	start := time.Now()
 	if err := c.Store.Put(ctx, key, rc, blobstore.PutOptions{}); err != nil {
 		return false, err
 	}
+	elapsed := time.Since(start)
+
+	log("blob %s %s uploaded in %s (%s)", blob.Digest, HumanBytes(blob.Size),
+		elapsed.Round(time.Millisecond), rate(blob.Size, elapsed))
 
 	return true, nil
 }
@@ -220,6 +235,8 @@ func (c *Copier) copyManifest(ctx context.Context, m *source.Manifest) (bool, er
 		return false, err
 	}
 	if existing != nil && existing.Size == int64(len(m.Raw)) && existing.ContentType == m.MediaType {
+		c.logger()("manifest %s present", m.Digest)
+
 		return false, nil
 	}
 
@@ -371,4 +388,30 @@ func ValidateTag(tag string) error {
 	}
 
 	return nil
+}
+
+// HumanBytes renders a size the way a person reads one.
+func HumanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+
+	div, exp := int64(unit), 0
+	for size := n / unit; size >= unit; size /= unit {
+		div *= unit
+		exp++
+	}
+
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// rate renders a transfer speed, or a dash when the transfer was too quick to
+// have one worth reporting.
+func rate(n int64, d time.Duration) string {
+	if d <= 0 {
+		return "instant"
+	}
+
+	return HumanBytes(int64(float64(n)/d.Seconds())) + "/s"
 }
