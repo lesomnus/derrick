@@ -74,7 +74,9 @@ go install github.com/lesomnus/derrick@latest
 
 ```
 derrick copy [flags] <source-image> s3://<bucket>/<repository>:<tag>
+derrick mirror [flags] <source-registry>[/<prefix>] s3://<bucket>
 derrick verify [flags] s3://<bucket>/<repository>:<tag>
+derrick ledger [flags] s3://<bucket>
 derrick version
 ```
 
@@ -109,6 +111,108 @@ A publish that stopped halfway looks healthy from the outside until something
 pulls the layer that is missing. On a robot fleet that is a bad place to find
 out.
 
+### mirror
+
+`mirror` is `copy` with the references filled in by the source registry instead
+of by an operator: it lists the repositories under a prefix, lists the tags in
+each, and copies the ones that are not already published.
+
+```bash
+derrick mirror cr.hday.io/dist s3://my-registry-bucket --endpoint ...
+```
+
+The repository name is carried across unchanged, so what a client pulls from
+the mirror differs from what it pulls from the source only in the hostname.
+There is deliberately no way to rewrite it: a mirror whose names do not match
+its source is a mirror nobody can reason about. That is also why the
+destination is a bucket and not a reference — there is nothing else to say.
+
+| flag | |
+| --- | --- |
+| `--parallel` | tags of one repository examined at once, default 4 |
+| `--exclude-repository` | `path.Match` pattern not to mirror; repeatable |
+| `--exclude-tag` | same, for tags |
+| `--recheck` | confirm every recorded tag against the bucket |
+| `--no-ledger` | examine every tag against the bucket and record nothing |
+| `--ledger` | key the ledger is stored under |
+
+plus everything `copy` takes.
+
+Tags named after a digest — `sha256-<hex>.sig` and friends — are skipped as
+images of their own. They are not lost: copying an image already carries its
+signatures and attestations across, so mirroring them separately would copy
+the same objects twice and publish tags that only mean something relative to a
+subject in the source registry.
+
+One repository failing does not stop the rest. A mirror of a hundred
+repositories should not abandon ninety-nine of them because one image is
+broken, so failures are collected, reported at the end, and the exit code is
+non-zero.
+
+### The ledger
+
+Repositories do not multiply, but tags do, and deciding whether a tag needs
+copying without a record means reading the destination — the tag object, the
+manifests below it, the blobs below those. That is a walk per tag, on every
+run, forever.
+
+So a mirror writes down what it copied, at `_derrick/ledger.jsonl` in the
+bucket it copied into:
+
+```json
+{"repository":"dist/perception","tag":"1.4.2","digest":"sha256:9f86d0…","at":"2026-08-28T12:00:00Z"}
+```
+
+A tag that is already recorded at the digest it still has costs one `HEAD`
+against the source and nothing else.
+
+Three things about it are worth being explicit, because the obvious design
+gets each of them wrong:
+
+**It is a cache, and the bucket is the truth.** Nothing recorded here changes
+what is servable. Deleting the ledger costs a slower run and never
+correctness: the next run examines everything, and copies nothing that is
+already there, because every object below a tag is content-addressed and
+skipped when present.
+
+**An entry is keyed by digest, not by name.** Recording that
+`dist/perception:1.4.2` is done would be wrong the moment that tag moves, and
+would stay wrong. The entry records the digest the tag had, so the skip is
+conditional on the source still pointing there and a moved tag re-copies on
+its own.
+
+**A tag nobody recorded is asked about before it is copied.** The bucket
+answers with one `HEAD`, and an answer of yes is recorded. That is what makes
+the first run against a bucket that was published into by other means — by
+`copy`, before there was a mirror — the only slow one.
+
+`--recheck` confirms each recorded tag against the bucket instead of trusting
+the record, which is how a mirror is reconciled with a bucket something else
+has been editing. It costs one `HEAD` against the bucket per known tag, which
+is cheap enough to run nightly and not cheap enough to run every time.
+
+Where the ledger lives is not incidental. It sits beside the repositories it
+describes, because a cache that can be separated from what it describes will
+eventually describe something else. The leading underscore is what keeps it out
+of the way: a repository name may not begin with one, so no image can collide
+with that key and no route a serverless-registry serves can be made to read it.
+
+### ledger
+
+`ledger` prints the ledger, which is how a human reads one without S3
+credentials to hand or an object store client installed:
+
+```bash
+$ derrick ledger s3://my-registry-bucket --endpoint ... > ledger.jsonl
+$ derrick ledger s3://my-registry-bucket --endpoint ... --summary
+s3://my-registry-bucket/_derrick/ledger.jsonl holds 438 tags
+  dist/control                                        61  newest 2026-08-28T02:11:04Z
+  dist/perception                                    377  newest 2026-08-28T02:14:52Z
+```
+
+Without `--summary` the entries are written out exactly as they are stored, so
+reading the ledger and downloading it are the same operation.
+
 ## The bucket layout
 
 ```
@@ -140,7 +244,10 @@ body.
 
 The layout, ordering and referrer rules are covered by unit tests, and the read
 side runs end to end in `go test` against a registry started in-process:
-images, multi-architecture indexes, republishing, and moving a tag.
+images, multi-architecture indexes, republishing, and moving a tag. The mirror
+runs there too — cataloguing a prefix, skipping what a ledger already records —
+and its skip, adopt, moved-tag and keep-going-after-a-failure rules are unit
+tested against a stand-in registry.
 
 The whole path has been run once for real: a signed multi-architecture image
 copied from `cgr.dev` into a Cloudflare R2 bucket, then pulled back out through

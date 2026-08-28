@@ -35,6 +35,24 @@ type Options struct {
 	Auth authn.Authenticator
 }
 
+func (o Options) nameOptions() []name.Option {
+	if o.Insecure {
+		return []name.Option{name.Insecure}
+	}
+
+	return nil
+}
+
+func (o Options) remoteOptions() []remote.Option {
+	if o.Auth != nil {
+		return []remote.Option{remote.WithAuth(o.Auth)}
+	}
+
+	// The docker config the operator already logged in with. A publisher runs
+	// where builds run, so those credentials are usually right there.
+	return []remote.Option{remote.WithAuthFromKeychain(authn.DefaultKeychain)}
+}
+
 // Source is one repository in a remote registry.
 type Source struct {
 	repo     name.Repository
@@ -45,26 +63,12 @@ type Source struct {
 // Open resolves reference and returns the repository it lives in along with
 // the manifest it points at.
 func Open(ctx context.Context, reference string, o Options) (*Source, *Manifest, error) {
-	var parseOpts []name.Option
-	if o.Insecure {
-		parseOpts = append(parseOpts, name.Insecure)
-	}
-
-	ref, err := name.ParseReference(reference, parseOpts...)
+	ref, err := name.ParseReference(reference, o.nameOptions()...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse %q: %w", reference, err)
 	}
 
-	var opts []remote.Option
-	if o.Auth != nil {
-		opts = append(opts, remote.WithAuth(o.Auth))
-	} else {
-		// The docker config the operator already logged in with. A publisher
-		// runs where builds run, so those credentials are usually right there.
-		opts = append(opts, remote.WithAuthFromKeychain(authn.DefaultKeychain))
-	}
-
-	s := &Source{repo: ref.Context(), insecure: o.Insecure, opts: opts}
+	s := &Source{repo: ref.Context(), insecure: o.Insecure, opts: o.remoteOptions()}
 
 	desc, err := remote.Get(ref, s.withContext(ctx)...)
 	if err != nil {

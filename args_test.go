@@ -74,3 +74,71 @@ func TestReorderParses(t *testing.T) {
 		t.Errorf("positionals = %q", fs.Args())
 	}
 }
+
+func TestParseMirrorSource(t *testing.T) {
+	for _, tc := range []struct {
+		in       string
+		registry string
+		prefix   string
+		bad      bool
+	}{
+		{in: "cr.hday.io/dist", registry: "cr.hday.io", prefix: "dist"},
+		{in: "cr.hday.io/dist/", registry: "cr.hday.io", prefix: "dist"},
+		{in: "cr.hday.io", registry: "cr.hday.io"},
+		{in: "cr.hday.io/dist/nested", registry: "cr.hday.io", prefix: "dist/nested"},
+		{in: "localhost:5000/dist", registry: "localhost:5000", prefix: "dist"},
+		{in: "https://cr.hday.io/dist", bad: true},
+		{in: "cr.hday.io/dist/perception:1.4.2", bad: true},
+		{in: "", bad: true},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			registry, prefix, err := parseMirrorSource(tc.in)
+			if tc.bad {
+				if err == nil {
+					t.Fatalf("parseMirrorSource(%q) was accepted", tc.in)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseMirrorSource(%q): %v", tc.in, err)
+			}
+			if registry != tc.registry || prefix != tc.prefix {
+				t.Errorf("parseMirrorSource(%q) = %q, %q, want %q, %q", tc.in, registry, prefix, tc.registry, tc.prefix)
+			}
+		})
+	}
+}
+
+func TestParseBucket(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+		bad  bool
+	}{
+		{in: "s3://registry-hday-io", want: "registry-hday-io"},
+		{in: "s3://registry-hday-io/", want: "registry-hday-io"},
+		// A mirror carries the repository name across unchanged, so a
+		// destination that names one is a misunderstanding worth refusing.
+		{in: "s3://registry-hday-io/dist", bad: true},
+		{in: "registry-hday-io", bad: true},
+		{in: "s3://", bad: true},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := parseBucket(tc.in)
+			if tc.bad {
+				if err == nil {
+					t.Fatalf("parseBucket(%q) was accepted as %q", tc.in, got)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseBucket(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseBucket(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
