@@ -179,6 +179,21 @@ attached to something else, or excluded by a pattern. A run that copies nothing
 should account for what it decided rather than report that it decided, and the
 log of one is a complete list of what is in the bucket and how it got there.
 
+A copy prints as a block: what happened to the tag, and under it, indented,
+every object that moved or did not.
+
+```
+dist/perception:1.4.2 copied at sha256:d7f3a1… in 1.4s — 3 blobs 41.2 MiB uploaded, 11 already present, 4 manifests, 1 referrers
+  blob sha256:2cd0e7… 18.1 MiB uploaded in 640ms (28.3 MiB/s)
+  blob sha256:1f6ea5… 4.2 MiB present
+  manifest sha256:b724a0… (application/vnd.oci.image.manifest.v1+json)
+  tag 1.4.2 -> sha256:d7f3a1…
+```
+
+Several tags copy at once, and the blocks stay whole: each copy's log is
+collected while it runs and printed when it finishes, so the interleaving
+happens between blocks rather than inside them.
+
 ### untag and prune
 
 Removing an image is two operations, because it is two questions.

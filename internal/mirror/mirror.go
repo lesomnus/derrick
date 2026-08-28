@@ -112,8 +112,59 @@ type Mirror struct {
 
 	// Log is called from several goroutines at once, for the same reason
 	// copier.Logger is, and with the tags of one repository in flight on top
-	// of that.
+	// of that. Everything this package writes goes through say or emit, which
+	// serialise it.
 	Log copier.Logger
+
+	logMu sync.Mutex
+}
+
+// say writes one line.
+func (m *Mirror) say(format string, args ...any) {
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
+
+	m.logger()(format, args...)
+}
+
+// emit writes a heading and the lines belonging under it, indented, with
+// nothing else allowed in between.
+//
+// This is why a mirror can copy several tags at once and still read like it
+// did them one at a time: each copy's own log is collected while it runs and
+// printed when it finishes, so the interleaving happens between blocks rather
+// than inside them.
+func (m *Mirror) emit(header string, body []string) {
+	m.logMu.Lock()
+	defer m.logMu.Unlock()
+
+	// Not through say: the lock is already held, and taking it again would
+	// deadlock rather than interleave.
+	log := m.logger()
+	log("%s", header)
+	for _, line := range body {
+		log("  %s", line)
+	}
+}
+
+// group collects what the copier says about one tag.
+type group struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (g *group) Log(format string, args ...any) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	g.lines = append(g.lines, fmt.Sprintf(format, args...))
+}
+
+func (g *group) body() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.lines
 }
 
 // Result reports what a run did.
@@ -174,7 +225,6 @@ func (m *Mirror) Run(ctx context.Context) (*Result, error) {
 		return nil, errors.New("--prune needs a store that can list and delete")
 	}
 
-	log := m.logger()
 	result := &Result{}
 
 	catalog, err := m.Registry.Catalog(ctx)
@@ -186,7 +236,7 @@ func (m *Mirror) Run(ctx context.Context) (*Result, error) {
 	result.Excluded += excluded
 	result.Repositories = len(repositories)
 
-	log("%s holds %d repositories, %d under %s", m.Registry.Name(), len(catalog), len(repositories), m.prefixDescription())
+	m.say("%s holds %d repositories, %d under %s", m.Registry.Name(), len(catalog), len(repositories), m.prefixDescription())
 
 	for _, repository := range repositories {
 		if err := ctx.Err(); err != nil {
@@ -205,10 +255,8 @@ func (m *Mirror) Run(ctx context.Context) (*Result, error) {
 // makes the rest of the run pointless is returned; a tag that could not be
 // copied is recorded in the result.
 func (m *Mirror) mirrorRepository(ctx context.Context, repository string, result *Result) error {
-	log := m.logger()
-
 	if err := copier.ValidateRepository(repository); err != nil {
-		log("warning: skipping repository %q: %v", repository, err)
+		m.say("warning: skipping repository %q: %v", repository, err)
 
 		return nil
 	}
@@ -227,14 +275,14 @@ func (m *Mirror) mirrorRepository(ctx context.Context, repository string, result
 		return nil
 	}
 
-	log("%s: %d tags listed", repository, len(listed))
+	m.say("%s: %d tags listed", repository, len(listed))
 
 	tags, excluded := m.selectTags(repository, listed)
 	result.Tags += len(tags)
 	result.Excluded += excluded
 
 	if len(tags) == 0 {
-		log("%s: nothing left to mirror", repository)
+		m.say("%s: nothing left to mirror", repository)
 
 		return nil
 	}
@@ -281,13 +329,11 @@ func (m *Mirror) mirrorRepository(ctx context.Context, repository string, result
 // that should be taken away; pruning against the filtered list would delete
 // every signature in the repository on the first run.
 func (m *Mirror) pruneVanishedTags(ctx context.Context, repository string, listed []string, result *Result) {
-	log := m.logger()
-
 	if len(listed) == 0 {
 		// A registry that answers with nothing looks exactly like a registry
 		// whose repository is empty, and one of those is a reason to delete
 		// every tag we have. Refuse to tell them apart.
-		log("warning: %s listed no tags at all, so nothing is being pruned from it", repository)
+		m.say("warning: %s listed no tags at all, so nothing is being pruned from it", repository)
 
 		return
 	}
@@ -321,7 +367,7 @@ func (m *Mirror) pruneVanishedTags(ctx context.Context, repository string, liste
 	}
 
 	for _, tag := range stale {
-		log("%s:%s is no longer in the source; removing the tag", repository, tag)
+		m.say("%s:%s is no longer in the source; removing the tag", repository, tag)
 		result.Pruned++
 
 		if m.DryRun {
@@ -341,8 +387,6 @@ type outcome struct {
 
 // mirrorTag copies one tag, unless it is already published.
 func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag string) outcome {
-	log := m.logger()
-
 	// The cheapest question that can be asked of the source: where does this
 	// tag point now. Everything below is decided from the answer.
 	digest, ok, err := repo.Digest(ctx, tag)
@@ -350,7 +394,7 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		return outcome{err: err}
 	}
 	if !ok {
-		log("%s:%s vanished before it could be resolved", repository, tag)
+		m.say("%s:%s vanished before it could be resolved", repository, tag)
 
 		return outcome{vanished: true}
 	}
@@ -363,7 +407,7 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		// Said out loud, and not only counted. A run that copies nothing
 		// should account for every tag it decided not to copy, or the log of
 		// a steady-state run says only that the mirror ran.
-		log("%s:%s present at %s", repository, tag, digest)
+		m.say("%s:%s present at %s", repository, tag, digest)
 
 		return outcome{}
 	}
@@ -376,12 +420,7 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		return outcome{vanished: true}
 	}
 
-	// Everything the copier logs is prefixed with the tag it is copying. A
-	// mirror has several copies in flight, and an interleaved log of bare
-	// digests says nothing about which image is slow or which one is stuck.
-	logTag := func(format string, args ...any) {
-		log("%s:%s "+format, append([]any{repository, tag}, args...)...)
-	}
+	body := &group{}
 
 	c := &copier.Copier{
 		Source:      repo,
@@ -392,18 +431,24 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		NoReferrers: m.NoReferrers,
 		CosignTags:  m.CosignTags,
 		Verify:      m.Verify,
-		Log:         logTag,
+		Log:         body.Log,
 	}
 
 	start := time.Now()
 	copied, err := c.Run(ctx, root, tag)
 	if err != nil {
+		// What it got through before it failed is the most useful thing in
+		// the log, so it is printed rather than dropped on the way out.
+		m.emit(fmt.Sprintf("%s:%s failed after %s: %v",
+			repository, tag, time.Since(start).Round(time.Millisecond), err), body.body())
+
 		return outcome{err: err}
 	}
 
-	logTag("copied at %s in %s (%d blobs %s uploaded, %d already present)",
-		root.Digest, time.Since(start).Round(time.Millisecond),
-		copied.BlobsUploaded, copier.HumanBytes(copied.BytesUploaded), copied.BlobsSkipped)
+	m.emit(fmt.Sprintf("%s:%s copied at %s in %s — %d blobs %s uploaded, %d already present, %d manifests, %d referrers",
+		repository, tag, root.Digest, time.Since(start).Round(time.Millisecond),
+		copied.BlobsUploaded, copier.HumanBytes(copied.BytesUploaded), copied.BlobsSkipped,
+		copied.ManifestsWritten+copied.ManifestsSkipped, copied.ReferrersWritten), body.body())
 
 	return outcome{copied: copied}
 }
@@ -446,7 +491,7 @@ func (m *Mirror) selectRepositories(catalog []string) ([]string, int) {
 			continue
 		}
 		if matchesAny(m.ExcludeRepositories, repository) {
-			m.logger()("%s is excluded by pattern", repository)
+			m.say("%s is excluded by pattern", repository)
 			excluded++
 
 			continue
@@ -473,19 +518,19 @@ func (m *Mirror) selectTags(repository string, listed []string) ([]string, int) 
 		// the work and publish a tag that means nothing here.
 		if source.IsAttachmentTag(tag) {
 			// Not lost: it comes across attached to the manifest it names.
-			m.logger()("%s:%s is an attachment; it travels with its subject", repository, tag)
+			m.say("%s:%s is an attachment; it travels with its subject", repository, tag)
 			excluded++
 
 			continue
 		}
 		if err := copier.ValidateTag(tag); err != nil {
-			m.logger()("warning: %s:%s is not a tag this bucket can hold: %v", repository, tag, err)
+			m.say("warning: %s:%s is not a tag this bucket can hold: %v", repository, tag, err)
 			excluded++
 
 			continue
 		}
 		if matchesAny(m.ExcludeTags, tag) {
-			m.logger()("%s:%s is excluded by pattern", repository, tag)
+			m.say("%s:%s is excluded by pattern", repository, tag)
 			excluded++
 
 			continue
