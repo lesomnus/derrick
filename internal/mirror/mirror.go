@@ -366,8 +366,16 @@ func (m *Mirror) pruneVanishedTags(ctx context.Context, repository string, liste
 		return
 	}
 
+	// A dry run says so. A log that reports a deletion that did not happen is
+	// worse than no log, because it is the one somebody reads afterwards to
+	// find out what happened.
+	verb := "removing"
+	if m.DryRun {
+		verb = "would remove"
+	}
+
 	for _, tag := range stale {
-		m.say("%s:%s is no longer in the source; removing the tag", repository, tag)
+		m.say("%s:%s is no longer in the source; %s the tag", repository, tag, verb)
 		result.Pruned++
 
 		if m.DryRun {

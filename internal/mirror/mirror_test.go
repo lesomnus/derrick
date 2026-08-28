@@ -612,9 +612,10 @@ func TestADryRunPrunesNothing(t *testing.T) {
 
 	repo.remove("1.4.1")
 
+	log := &recorder{}
 	result := run(t, &mirror.Mirror{
 		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist",
-		Prune: true, DryRun: true,
+		Prune: true, DryRun: true, Log: log.Log,
 	})
 
 	if result.Pruned != 1 {
@@ -622,6 +623,9 @@ func TestADryRunPrunesNothing(t *testing.T) {
 	}
 	if _, ok := store.Body("dist/perception/manifests/1.4.1"); !ok {
 		t.Error("a dry run deleted the tag object")
+	}
+	if text := log.text(); !strings.Contains(text, "would remove") || strings.Contains(text, "; removing") {
+		t.Errorf("a dry run said it removed something:\n%s", text)
 	}
 }
 

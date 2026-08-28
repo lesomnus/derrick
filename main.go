@@ -392,7 +392,11 @@ func runMirror(ctx context.Context, args []string) error {
 	fmt.Printf("  skipped       %d\n", result.Skipped)
 	fmt.Printf("  excluded      %d\n", result.Excluded)
 	if *prune {
-		fmt.Printf("  pruned        %d tags no longer in the source\n", result.Pruned)
+		if *dryRun {
+			fmt.Printf("  would prune   %d tags no longer in the source\n", result.Pruned)
+		} else {
+			fmt.Printf("  pruned        %d tags no longer in the source\n", result.Pruned)
+		}
 	}
 	if result.Vanished > 0 {
 		fmt.Printf("  vanished      %d\n", result.Vanished)
