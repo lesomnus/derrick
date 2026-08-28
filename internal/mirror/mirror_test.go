@@ -15,7 +15,6 @@ import (
 
 	"github.com/lesomnus/derrick/internal/blobstore"
 	"github.com/lesomnus/derrick/internal/layout"
-	"github.com/lesomnus/derrick/internal/ledger"
 	"github.com/lesomnus/derrick/internal/mirror"
 	"github.com/lesomnus/derrick/internal/source"
 )
@@ -217,7 +216,6 @@ func TestMirrorsOnlyThePrefix(t *testing.T) {
 		Store:    store,
 		Bucket:   "registry-test",
 		Prefix:   "dist",
-		Ledger:   ledger.New(),
 	})
 
 	if result.Repositories != 2 {
@@ -248,9 +246,8 @@ func TestASecondRunCopiesNothing(t *testing.T) {
 	repo := registry.repository(t, "dist/perception", "1.4.1", "1.4.2")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
 	newMirror := func() *mirror.Mirror {
-		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book}
+		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"}
 	}
 
 	run(t, newMirror())
@@ -268,8 +265,9 @@ func TestASecondRunCopiesNothing(t *testing.T) {
 	if got := len(store.Writes); got != writes {
 		t.Fatalf("the second run wrote %d objects, want none", got-writes)
 	}
-	// The whole point of the ledger: a known tag costs the HEAD that resolves
-	// it and nothing more.
+	// A tag that has not moved costs the HEAD that resolves it in the source
+	// and the HEAD that finds it in the bucket, and nothing more: the image
+	// behind it is never fetched.
 	if got := repo.fetches.Load(); got != fetches {
 		t.Fatalf("the second run fetched %d manifests, want none", got-fetches)
 	}
@@ -283,9 +281,8 @@ func TestAMovedTagIsCopiedAgain(t *testing.T) {
 	repo := registry.repository(t, "dist/perception", "stable")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
 	newMirror := func() *mirror.Mirror {
-		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book}
+		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"}
 	}
 
 	run(t, newMirror())
@@ -305,13 +302,6 @@ func TestAMovedTagIsCopiedAgain(t *testing.T) {
 		t.Fatalf("the tag object records %s, want %s", got, moved.Digest)
 	}
 
-	entry, ok := book.Lookup("dist/perception", "stable")
-	if !ok {
-		t.Fatal("the moved tag left no ledger entry")
-	}
-	if entry.Digest != moved.Digest {
-		t.Fatalf("the ledger records %s, want %s", entry.Digest, moved.Digest)
-	}
 }
 
 func TestAttachmentTagsAreNotMirroredOnTheirOwn(t *testing.T) {
@@ -326,7 +316,6 @@ func TestAttachmentTagsAreNotMirroredOnTheirOwn(t *testing.T) {
 		Store:    store,
 		Bucket:   "registry-test",
 		Prefix:   "dist",
-		Ledger:   ledger.New(),
 	})
 
 	if result.Copied != 1 {
@@ -345,45 +334,38 @@ func TestAttachmentTagsAreNotMirroredOnTheirOwn(t *testing.T) {
 	}
 }
 
-func TestAlreadyPublishedTagsAreAdoptedIntoTheLedger(t *testing.T) {
+// Nothing is remembered between runs, so a bucket somebody else filled — a
+// `derrick copy`, a promote — is skipped for the same reason a bucket this
+// mirror filled is.
+func TestABucketFilledBySomethingElseIsNotCopiedAgain(t *testing.T) {
 	registry := newFakeRegistry()
 	repo := registry.repository(t, "dist/perception", "1.4.2")
 
 	store := blobstore.NewMemory()
-
-	// A bucket published into before there was a ledger, by a promote.
 	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 	fetches := repo.fetches.Load()
 
-	book := ledger.New()
-	result := run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	result := run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
 	if result.Copied != 0 {
 		t.Fatalf("copied %d tags into a bucket that already had them, want 0", result.Copied)
 	}
 	if got := repo.fetches.Load(); got != fetches {
-		t.Fatalf("fetched %d manifests to adopt a published tag, want none", got-fetches)
-	}
-	if _, ok := book.Lookup("dist/perception", "1.4.2"); !ok {
-		t.Fatal("an already-published tag was not recorded, so the next run will look again")
-	}
-	if _, err := book.Save(context.Background(), store, ledger.DefaultKey); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	if _, ok := store.Body(ledger.DefaultKey); !ok {
-		t.Fatal("the ledger was not written to the bucket")
+		t.Fatalf("fetched %d manifests to decide a tag was already there, want none", got-fetches)
 	}
 }
 
-func TestRecheckNoticesAMissingTagObject(t *testing.T) {
+// Asking the bucket rather than a record is what makes this come out right on
+// its own: there is nothing to reconcile, because there was never a second
+// opinion.
+func TestATagDeletedFromTheBucketIsCopiedAgain(t *testing.T) {
 	registry := newFakeRegistry()
 	registry.repository(t, "dist/perception", "1.4.2")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
-	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
-	// Something removed the tag object; the ledger still says it is published.
+	// Something removed the tag object.
 	forgetful := &forgetfulStore{Memory: store, missing: "dist/perception/manifests/1.4.2"}
 
 	result := run(t, &mirror.Mirror{
@@ -391,8 +373,6 @@ func TestRecheckNoticesAMissingTagObject(t *testing.T) {
 		Store:    forgetful,
 		Bucket:   "registry-test",
 		Prefix:   "dist",
-		Ledger:   book,
-		Recheck:  true,
 	})
 
 	if result.Copied != 1 {
@@ -427,7 +407,6 @@ func TestOneBrokenRepositoryDoesNotStopTheRest(t *testing.T) {
 		Store:    store,
 		Bucket:   "registry-test",
 		Prefix:   "dist",
-		Ledger:   ledger.New(),
 	})
 
 	if result.Copied != 1 {
@@ -452,7 +431,6 @@ func TestExclusions(t *testing.T) {
 		Store:               store,
 		Bucket:              "registry-test",
 		Prefix:              "dist",
-		Ledger:              ledger.New(),
 		ExcludeRepositories: []string{"dist/sandbox"},
 		ExcludeTags:         []string{"nightly"},
 	})
@@ -494,13 +472,11 @@ func TestDryRunWritesNothing(t *testing.T) {
 	registry.repository(t, "dist/perception", "1.4.2")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
 	result := run(t, &mirror.Mirror{
 		Registry: registry,
 		Store:    store,
 		Bucket:   "registry-test",
 		Prefix:   "dist",
-		Ledger:   book,
 		DryRun:   true,
 	})
 
@@ -509,9 +485,6 @@ func TestDryRunWritesNothing(t *testing.T) {
 	}
 	if len(store.Writes) != 0 {
 		t.Fatalf("a dry run wrote %v", store.Writes)
-	}
-	if book.Len() != 0 {
-		t.Fatal("a dry run recorded a tag it did not copy")
 	}
 }
 
@@ -526,13 +499,12 @@ func TestPruneRemovesATagTheSourceNoLongerHas(t *testing.T) {
 	repo := registry.repository(t, "dist/perception", "1.4.1", "1.4.2")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
-	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
 	repo.remove("1.4.1")
 
 	result := run(t, &mirror.Mirror{
-		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book, Prune: true,
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Prune: true,
 	})
 
 	if result.Pruned != 1 {
@@ -543,12 +515,6 @@ func TestPruneRemovesATagTheSourceNoLongerHas(t *testing.T) {
 	}
 	if _, ok := store.Body("dist/perception/manifests/1.4.2"); !ok {
 		t.Error("the tag that is still in the source was pruned")
-	}
-
-	// Leaving the entry behind would make the next run skip a tag that is not
-	// there, and the next --recheck put it back.
-	if _, ok := book.Lookup("dist/perception", "1.4.1"); ok {
-		t.Error("the ledger still records the pruned tag")
 	}
 
 	// Only the tag object goes. What it was holding up is a question about the
@@ -572,11 +538,10 @@ func TestPruneLeavesAttachmentTagsAlone(t *testing.T) {
 	repo.tag(t, signature, "a-signature")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
-	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
 	result := run(t, &mirror.Mirror{
-		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book, Prune: true,
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Prune: true,
 	})
 
 	// The copier published it, the walk skipped it, and the source still has
@@ -595,13 +560,12 @@ func TestPruneLeavesAnExcludedTagAlone(t *testing.T) {
 	registry.repository(t, "dist/perception", "1.4.2", "r0")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
 
 	// Published before anybody decided not to publish it.
-	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
 	result := run(t, &mirror.Mirror{
-		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book,
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist",
 		Prune: true, ExcludeTags: []string{"r0"},
 	})
 
@@ -620,15 +584,14 @@ func TestPruneRefusesWhenTheSourceListsNothing(t *testing.T) {
 	repo := registry.repository(t, "dist/perception", "1.4.2")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
-	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
 	// A registry answering with nothing looks exactly like a repository that
 	// is empty, and one of those is a reason to delete every tag we have.
 	repo.remove("1.4.2")
 
 	result := run(t, &mirror.Mirror{
-		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book, Prune: true,
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Prune: true,
 	})
 
 	if result.Pruned != 0 {
@@ -644,13 +607,12 @@ func TestADryRunPrunesNothing(t *testing.T) {
 	repo := registry.repository(t, "dist/perception", "1.4.1", "1.4.2")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
-	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"})
 
 	repo.remove("1.4.1")
 
 	result := run(t, &mirror.Mirror{
-		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book,
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist",
 		Prune: true, DryRun: true,
 	})
 
@@ -659,8 +621,5 @@ func TestADryRunPrunesNothing(t *testing.T) {
 	}
 	if _, ok := store.Body("dist/perception/manifests/1.4.1"); !ok {
 		t.Error("a dry run deleted the tag object")
-	}
-	if _, ok := book.Lookup("dist/perception", "1.4.1"); !ok {
-		t.Error("a dry run changed the ledger")
 	}
 }

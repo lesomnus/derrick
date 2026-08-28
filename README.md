@@ -78,7 +78,6 @@ derrick mirror [flags] <source-registry>[/<prefix>] s3://<bucket>
 derrick verify [flags] s3://<bucket>/<repository>:<tag>
 derrick untag [flags] s3://<bucket>/<repository>:<tag>
 derrick prune [flags] s3://<bucket>/<repository>
-derrick ledger [flags] s3://<bucket>
 derrick version
 ```
 
@@ -135,9 +134,6 @@ destination is a bucket and not a reference — there is nothing else to say.
 | `--exclude-repository` | `path.Match` pattern not to mirror; repeatable |
 | `--exclude-tag` | same, for tags |
 | `--prune` | remove destination tags the source no longer has |
-| `--recheck` | confirm every recorded tag against the bucket |
-| `--no-ledger` | examine every tag against the bucket and record nothing |
-| `--ledger` | key the ledger is stored under |
 
 plus everything `copy` takes.
 
@@ -152,53 +148,31 @@ repositories should not abandon ninety-nine of them because one image is
 broken, so failures are collected, reported at the end, and the exit code is
 non-zero.
 
-### The ledger
+### What it skips
 
-Repositories do not multiply, but tags do, and deciding whether a tag needs
-copying without a record means reading the destination — the tag object, the
-manifests below it, the blobs below those. That is a walk per tag, on every
-run, forever.
+A tag is copied when the bucket does not already have it at the digest the
+source has it at. That is two `HEAD` requests — one asking the source where the
+tag points, one asking the bucket what is under that tag — and no more: the
+image behind an unchanged tag is never fetched, and neither is anything below
+it.
 
-So a mirror writes down what it copied, at `_derrick/ledger.jsonl` in the
-bucket it copied into:
+There is deliberately no record kept between runs. An earlier version of this
+wrote down what it had copied, on the theory that it saved a walk of the
+destination; it did not, because the check above was never a walk. What a
+record would save is the second of those two `HEAD`s, against a bucket, which
+is the cheaper half of an already cheap question — and it would cost the thing
+that makes this simple. A record can be wrong. Something deletes an object by
+hand, a run dies between the copy and the save, and now there are two opinions
+about what is published and a flag to reconcile them. Asking the bucket has one
+opinion, and it is the one that serves the pull.
 
-```json
-{"repository":"dist/perception","tag":"1.4.2","digest":"sha256:9f86d0…","at":"2026-08-28T12:00:00Z"}
-```
+So a tag that moved, an object someone removed, and a run that was interrupted
+all come out right on the next run without anyone deciding anything.
 
-A tag that is already recorded at the digest it still has costs one `HEAD`
-against the source and nothing else.
-
-Three things about it are worth being explicit, because the obvious design
-gets each of them wrong:
-
-**It is a cache, and the bucket is the truth.** Nothing recorded here changes
-what is servable. Deleting the ledger costs a slower run and never
-correctness: the next run examines everything, and copies nothing that is
-already there, because every object below a tag is content-addressed and
-skipped when present.
-
-**An entry is keyed by digest, not by name.** Recording that
-`dist/perception:1.4.2` is done would be wrong the moment that tag moves, and
-would stay wrong. The entry records the digest the tag had, so the skip is
-conditional on the source still pointing there and a moved tag re-copies on
-its own.
-
-**A tag nobody recorded is asked about before it is copied.** The bucket
-answers with one `HEAD`, and an answer of yes is recorded. That is what makes
-the first run against a bucket that was published into by other means — by
-`copy`, before there was a mirror — the only slow one.
-
-`--recheck` confirms each recorded tag against the bucket instead of trusting
-the record, which is how a mirror is reconciled with a bucket something else
-has been editing. It costs one `HEAD` against the bucket per known tag, which
-is cheap enough to run nightly and not cheap enough to run every time.
-
-Where the ledger lives is not incidental. It sits beside the repositories it
-describes, because a cache that can be separated from what it describes will
-eventually describe something else. The leading underscore is what keeps it out
-of the way: a repository name may not begin with one, so no image can collide
-with that key and no route a serverless-registry serves can be made to read it.
+What that costs is one bucket `HEAD` per tag per run: at ten thousand tags,
+well inside what an object store gives away, and a second or two of wall clock
+at any sane parallelism. The request that cannot be avoided either way is the
+one against the source, and it is the expensive one.
 
 ### untag and prune
 
@@ -212,9 +186,8 @@ derrick untag s3://my-registry-bucket/dist/perception:1.4.1 --endpoint ...
 
 It deletes the one object the tag is, which is atomic from a client's point of
 view in the same way publishing it was. The image stays pullable by digest and
-by any other tag pointing at it, and the ledger entry goes with the tag — left
-behind, it would make the next mirror skip a tag that is not there and the
-next `--recheck` put it back.
+by any other tag pointing at it. Nothing else has to be told: the next mirror
+asks the bucket, and the bucket no longer has the tag.
 
 `prune` answers the second: what in this repository is now holding up nothing.
 
@@ -258,22 +231,6 @@ prunes nothing — a registry answering with nothing looks exactly like a
 repository that is empty, and one of those is a reason to delete every tag you
 have.
 
-### ledger
-
-`ledger` prints the ledger, which is how a human reads one without S3
-credentials to hand or an object store client installed:
-
-```bash
-$ derrick ledger s3://my-registry-bucket --endpoint ... > ledger.jsonl
-$ derrick ledger s3://my-registry-bucket --endpoint ... --summary
-s3://my-registry-bucket/_derrick/ledger.jsonl holds 438 tags
-  dist/control                                        61  newest 2026-08-28T02:11:04Z
-  dist/perception                                    377  newest 2026-08-28T02:14:52Z
-```
-
-Without `--summary` the entries are written out exactly as they are stored, so
-reading the ledger and downloading it are the same operation.
-
 ## The bucket layout
 
 ```
@@ -306,7 +263,7 @@ body.
 The layout, ordering and referrer rules are covered by unit tests, and the read
 side runs end to end in `go test` against a registry started in-process:
 images, multi-architecture indexes, republishing, and moving a tag. The mirror
-runs there too — cataloguing a prefix, skipping what a ledger already records —
+runs there too — cataloguing a prefix, skipping what the bucket already has —
 and its skip, adopt, moved-tag and keep-going-after-a-failure rules are unit
 tested against a stand-in registry. The prune rules — shared layers, signatures,
 the grace period, the refusals — are tested against a bucket written by hand,

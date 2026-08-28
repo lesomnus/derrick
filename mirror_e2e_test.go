@@ -10,7 +10,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/lesomnus/derrick/internal/blobstore"
-	"github.com/lesomnus/derrick/internal/ledger"
 	"github.com/lesomnus/derrick/internal/mirror"
 	"github.com/lesomnus/derrick/internal/source"
 	"github.com/lesomnus/derrick/internal/verify"
@@ -36,7 +35,7 @@ func pushTo(t *testing.T, host, repository, tag string) v1.Image {
 	return image
 }
 
-func mirrorRegistry(t *testing.T, host string, store blobstore.Store, book *ledger.Ledger) *mirror.Result {
+func mirrorRegistry(t *testing.T, host string, store blobstore.Store) *mirror.Result {
 	t.Helper()
 
 	registry, err := source.OpenRegistry(host, source.Options{Insecure: true})
@@ -49,7 +48,6 @@ func mirrorRegistry(t *testing.T, host string, store blobstore.Store, book *ledg
 		Store:    store,
 		Bucket:   "registry-test",
 		Prefix:   "dist",
-		Ledger:   book,
 		Parallel: 3,
 		Verify:   true,
 		Log:      func(format string, args ...any) { t.Logf(format, args...) },
@@ -75,9 +73,8 @@ func TestMirrorAPrefixOfARegistry(t *testing.T) {
 	pushTo(t, host, "external/ghcr.io/foo/bar", "1.0")
 
 	store := blobstore.NewMemory()
-	book := ledger.New()
 
-	result := mirrorRegistry(t, host, store, book)
+	result := mirrorRegistry(t, host, store)
 
 	if result.Repositories != 2 {
 		t.Errorf("mirrored %d repositories, want 2", result.Repositories)
@@ -114,13 +111,11 @@ func TestMirrorAPrefixOfARegistry(t *testing.T) {
 		t.Error("a repository outside the prefix was mirrored")
 	}
 
-	if book.Len() != 3 {
-		t.Errorf("the ledger holds %d tags, want 3", book.Len())
-	}
 }
 
-// What the ledger is for: the second run asks the registry where each tag
-// points, finds it has not moved, and stops there.
+// The second run asks the source where each tag points and the bucket whether
+// it is already there, finds they agree, and stops. Nothing is remembered
+// between runs, and nothing needs to be.
 func TestMirrorSkipsWhatItAlreadyCopied(t *testing.T) {
 	host := serve(t)
 
@@ -128,27 +123,11 @@ func TestMirrorSkipsWhatItAlreadyCopied(t *testing.T) {
 	pushTo(t, host, "dist/control", "2.0.0")
 
 	store := blobstore.NewMemory()
-	ctx := context.Background()
 
-	book := ledger.New()
-	mirrorRegistry(t, host, store, book)
-
-	if _, err := book.Save(ctx, store, ledger.DefaultKey); err != nil {
-		t.Fatalf("save ledger: %v", err)
-	}
+	mirrorRegistry(t, host, store)
 	writes := len(store.Writes)
 
-	// A fresh ledger read back out of the bucket, which is what the next run
-	// actually starts from.
-	reloaded, err := ledger.Load(ctx, store, ledger.DefaultKey)
-	if err != nil {
-		t.Fatalf("load ledger: %v", err)
-	}
-	if reloaded.Len() != 2 {
-		t.Fatalf("the reloaded ledger holds %d tags, want 2", reloaded.Len())
-	}
-
-	result := mirrorRegistry(t, host, store, reloaded)
+	result := mirrorRegistry(t, host, store)
 
 	if result.Copied != 0 {
 		t.Errorf("the second run copied %d tags, want 0", result.Copied)

@@ -20,7 +20,6 @@ import (
 	"github.com/lesomnus/derrick/internal/blobstore"
 	"github.com/lesomnus/derrick/internal/copier"
 	"github.com/lesomnus/derrick/internal/layout"
-	"github.com/lesomnus/derrick/internal/ledger"
 	"github.com/lesomnus/derrick/internal/source"
 )
 
@@ -85,10 +84,6 @@ type Mirror struct {
 	// names do not match its source is a mirror nobody can reason about.
 	Prefix string
 
-	// Ledger records what has been copied. A nil Ledger examines every tag
-	// against the destination on every run, which is correct and slow.
-	Ledger *ledger.Ledger
-
 	// Prune removes destination tags the source no longer has.
 	//
 	// It removes the tag object and nothing else. What the tag was holding up
@@ -96,14 +91,6 @@ type Mirror struct {
 	// about the whole repository — which is `derrick prune`, deliberately a
 	// separate command with its own grace period.
 	Prune bool
-
-	// Recheck verifies a ledger entry against the bucket instead of trusting
-	// it. The ledger is a cache of what this tool did, and something else can
-	// have happened to the bucket since — an object deleted by hand, a
-	// half-finished run before the ledger was saved. This is how a mirror is
-	// reconciled with what is actually servable, at the cost of one HEAD
-	// against the bucket per already-known tag.
-	Recheck bool
 
 	// ExcludeRepositories and ExcludeTags are path.Match patterns. A pattern
 	// is matched against the whole repository name or the whole tag, and `*`
@@ -207,13 +194,6 @@ func (m *Mirror) Run(ctx context.Context) (*Result, error) {
 		}
 
 		if err := m.mirrorRepository(ctx, repository, result); err != nil {
-			return result, err
-		}
-
-		// Saved per repository rather than once at the end, so that a run that
-		// is interrupted — and a fleet-wide mirror is a long thing to hold
-		// open — keeps the progress it made.
-		if err := m.saveLedger(ctx); err != nil {
 			return result, err
 		}
 	}
@@ -349,11 +329,6 @@ func (m *Mirror) pruneVanishedTags(ctx context.Context, repository string, liste
 		}
 		if err := bucket.Delete(ctx, layout.ManifestKey(repository, tag)); err != nil {
 			result.Failures = append(result.Failures, Failure{Repository: repository, Tag: tag, Err: err})
-
-			continue
-		}
-		if m.Ledger != nil {
-			m.Ledger.Forget(repository, tag)
 		}
 	}
 }
@@ -425,64 +400,22 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		root.Digest, time.Since(start).Round(time.Millisecond),
 		copied.BlobsUploaded, copier.HumanBytes(copied.BytesUploaded), copied.BlobsSkipped)
 
-	// The digest recorded is the manifest that was actually copied, not the
-	// one the HEAD above reported. They differ when the tag moved in between,
-	// and recording what was copied is what keeps the ledger honest.
-	if m.Ledger != nil && !m.DryRun {
-		m.Ledger.Record(repository, tag, root.Digest, time.Now())
-	}
-
 	return outcome{copied: copied}
 }
 
-// published reports whether the tag at digest is already in the bucket.
-func (m *Mirror) published(ctx context.Context, repository, tag, digest string) (bool, error) {
-	if m.Ledger == nil {
-		return m.publishedInBucket(ctx, repository, tag, digest)
-	}
-
-	entry, recorded := m.Ledger.Lookup(repository, tag)
-	switch {
-	case recorded && entry.Digest != digest:
-		// The tag moved. Nothing has to be undone: the old manifest and its
-		// blobs stay where they are, and rewriting the tag object is what
-		// moves it here too.
-		m.logger()("%s:%s moved from %s to %s", repository, tag, entry.Digest, digest)
-
-	case recorded && !m.Recheck:
-		return true, nil
-	}
-
-	// Nothing is recorded for this tag, or the record is stale, or --recheck
-	// asked for it to be confirmed. All three are answered by the bucket.
-	published, err := m.publishedInBucket(ctx, repository, tag, digest)
-	if err != nil {
-		return false, err
-	}
-
-	switch {
-	case published && (!recorded || entry.Digest != digest):
-		// Already there, and the ledger did not know. This is what a bucket
-		// that was published into before it had a ledger looks like, and
-		// recording it now is what makes the first run the only slow one.
-		m.Ledger.Record(repository, tag, digest, time.Now())
-
-	case !published && recorded:
-		m.logger()("%s:%s is recorded as mirrored but the bucket disagrees; copying it again", repository, tag)
-		m.Ledger.Forget(repository, tag)
-	}
-
-	return published, nil
-}
-
-// publishedInBucket asks the destination rather than the ledger.
+// published reports whether this tag is already in the bucket at this digest.
 //
-// This reads the tag object alone, which is enough to tell that this tag was
-// published at this digest, and not enough to tell that everything below it
+// This is the whole skip decision, and it is deliberately a question rather
+// than a record. The bucket is what serves a pull, so the bucket is what gets
+// asked: it costs one HEAD, it cannot go stale, and a tag that moved, an
+// object someone deleted by hand and a run that died halfway all come out of
+// it correctly with nothing to reconcile.
+//
+// It reads the tag object alone, which is enough to tell that this tag was
+// published at this digest and not enough to tell that everything below it
 // survived. `derrick verify` is the walk that answers that, and it is a
-// different and much more expensive question than the one a mirror asks per
-// tag.
-func (m *Mirror) publishedInBucket(ctx context.Context, repository, tag, digest string) (bool, error) {
+// different and much larger question than the one a mirror asks per tag.
+func (m *Mirror) published(ctx context.Context, repository, tag, digest string) (bool, error) {
 	obj, err := m.Store.Stat(ctx, layout.ManifestKey(repository, tag))
 	if err != nil {
 		return false, err
@@ -492,22 +425,6 @@ func (m *Mirror) publishedInBucket(ctx context.Context, repository, tag, digest 
 	}
 
 	return obj.Metadata[layout.DigestMetadataKey] == digest, nil
-}
-
-func (m *Mirror) saveLedger(ctx context.Context) error {
-	if m.Ledger == nil || m.DryRun {
-		return nil
-	}
-
-	saved, err := m.Ledger.Save(ctx, m.Store, ledger.DefaultKey)
-	if err != nil {
-		return err
-	}
-	if saved {
-		m.logger()("ledger: %d tags recorded", m.Ledger.Len())
-	}
-
-	return nil
 }
 
 // selectRepositories keeps the repositories under the prefix that no exclusion

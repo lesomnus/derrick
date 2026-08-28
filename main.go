@@ -12,12 +12,10 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/lesomnus/derrick/internal/blobstore"
 	"github.com/lesomnus/derrick/internal/copier"
 	"github.com/lesomnus/derrick/internal/layout"
-	"github.com/lesomnus/derrick/internal/ledger"
 	"github.com/lesomnus/derrick/internal/mirror"
 	"github.com/lesomnus/derrick/internal/pruner"
 	"github.com/lesomnus/derrick/internal/source"
@@ -33,16 +31,14 @@ usage:
   derrick verify [flags] s3://<bucket>/<repository>:<tag>
   derrick untag [flags] s3://<bucket>/<repository>:<tag>
   derrick prune [flags] s3://<bucket>/<repository>
-  derrick ledger [flags] s3://<bucket>
   derrick version
 
 Signatures, attestations and SBOMs attached to the image are copied with it,
 found through the referrers API and through the tags cosign falls back to.
 
 A mirror copies every tag of every repository under a prefix, carrying the
-repository name across unchanged, and records what it copied in a ledger in
-the bucket so that a later run examines a known tag with one request instead
-of walking the image behind it.
+repository name across unchanged, and copies only what the bucket does not
+already have at the digest the source has it at.
 
 Credentials come from the environment: AWS_ACCESS_KEY_ID and
 AWS_SECRET_ACCESS_KEY for the bucket, and the ambient docker login for the
@@ -92,8 +88,6 @@ func run(ctx context.Context, args []string) error {
 		return runUntag(ctx, args[1:])
 	case "prune":
 		return runPrune(ctx, args[1:])
-	case "ledger":
-		return runLedger(ctx, args[1:])
 	case "version":
 		fmt.Println(version())
 
@@ -322,9 +316,6 @@ func runMirror(ctx context.Context, args []string) error {
 		excludeTags  stringList
 		parallel     = fs.Int("parallel", 4, "how many tags of one repository to examine at once")
 		prune        = fs.Bool("prune", false, "remove destination tags the source no longer has")
-		recheck      = fs.Bool("recheck", false, "confirm every recorded tag against the bucket instead of trusting the ledger")
-		noLedger     = fs.Bool("no-ledger", false, "examine every tag against the bucket and record nothing")
-		ledgerKey    = fs.String("ledger", ledger.DefaultKey, "key the ledger is stored under, in the destination bucket")
 		dryRun       = fs.Bool("dry-run", false, "report what would be copied without writing it")
 		noReferrers  = fs.Bool("no-referrers", false, "skip signatures, attestations and SBOMs")
 		doVerify     = fs.Bool("verify", false, "re-read every object after writing it")
@@ -368,23 +359,12 @@ func runMirror(ctx context.Context, args []string) error {
 		return err
 	}
 
-	var book *ledger.Ledger
-	if !*noLedger {
-		book, err = ledger.Load(ctx, st, *ledgerKey)
-		if err != nil {
-			return err
-		}
-		log("ledger holds %d tags", book.Len())
-	}
-
 	m := &mirror.Mirror{
 		Registry:            mirror.FromSource(reg),
 		Store:               st,
 		Bucket:              bucket,
 		Prefix:              prefix,
-		Ledger:              book,
 		Prune:               *prune,
-		Recheck:             *recheck,
 		ExcludeRepositories: excludeRepos,
 		ExcludeTags:         excludeTags,
 		Parallel:            *parallel,
@@ -435,82 +415,9 @@ func runMirror(ctx context.Context, args []string) error {
 	return nil
 }
 
-func runLedger(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("ledger", flag.ContinueOnError)
-	var (
-		store     storeFlags
-		ledgerKey = fs.String("ledger", ledger.DefaultKey, "key the ledger is stored under")
-		summary   = fs.Bool("summary", false, "print a count per repository instead of the entries")
-	)
-	store.bind(fs)
-	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
-
-	if err := fs.Parse(reorder(fs, args)); err != nil {
-		return err
-	}
-	if fs.NArg() != 1 {
-		fs.Usage()
-
-		return errors.New("ledger takes a bucket")
-	}
-
-	bucket, err := parseBucket(fs.Arg(0))
-	if err != nil {
-		return err
-	}
-
-	st, err := store.open(ctx, bucket)
-	if err != nil {
-		return err
-	}
-
-	book, err := ledger.Load(ctx, st, *ledgerKey)
-	if err != nil {
-		return err
-	}
-
-	if !*summary {
-		// The entries are written out exactly as they are stored, so that
-		// reading the ledger and downloading it are the same operation.
-		_, err := book.WriteTo(os.Stdout)
-
-		return err
-	}
-
-	entries := book.Entries()
-	fmt.Printf("%s%s/%s holds %d tags\n", target.Scheme, bucket, *ledgerKey, len(entries))
-
-	repository := ""
-	count := 0
-	newest := time.Time{}
-	flush := func() {
-		if repository == "" {
-			return
-		}
-		fmt.Printf("  %-48s %5d  newest %s\n", repository, count, newest.Format(time.RFC3339))
-	}
-	for _, entry := range entries {
-		if entry.Repository != repository {
-			flush()
-			repository, count, newest = entry.Repository, 0, time.Time{}
-		}
-		count++
-		if entry.At.After(newest) {
-			newest = entry.At
-		}
-	}
-	flush()
-
-	return nil
-}
-
 func runUntag(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("untag", flag.ContinueOnError)
-	var (
-		store     storeFlags
-		ledgerKey = fs.String("ledger", ledger.DefaultKey, "key the ledger is stored under")
-		noLedger  = fs.Bool("no-ledger", false, "do not update the ledger")
-	)
+	var store storeFlags
 	store.bind(fs)
 	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
 
@@ -546,19 +453,6 @@ func runUntag(ctx context.Context, args []string) error {
 
 	if err := st.Delete(ctx, key); err != nil {
 		return err
-	}
-
-	// The ledger says this tag is published. Leaving that behind would make
-	// the next mirror skip it, and the next --recheck put it back.
-	if !*noLedger {
-		book, err := ledger.Load(ctx, st, *ledgerKey)
-		if err != nil {
-			return err
-		}
-		book.Forget(ref.Repository, ref.Tag)
-		if _, err := book.Save(ctx, st, *ledgerKey); err != nil {
-			return err
-		}
 	}
 
 	fmt.Printf("untagged %s\n", ref)
