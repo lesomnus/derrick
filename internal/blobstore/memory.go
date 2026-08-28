@@ -28,6 +28,10 @@ type Memory struct {
 	// Deletes records the key of every Delete in the order it happened.
 	Deletes []string
 
+	// stats counts Stat calls, which is how a test tells a walk that asks
+	// about an object once from one that asks per reference to it.
+	stats int
+
 	// Clock stamps an object's modification time. Reclaiming space turns on
 	// how old an object is, so a test needs to be able to say.
 	Clock func() time.Time
@@ -48,6 +52,8 @@ func NewMemory() *Memory {
 func (m *Memory) Stat(_ context.Context, key string) (*Object, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.stats++
 
 	obj, ok := m.objects[key]
 	if !ok {
@@ -161,6 +167,14 @@ func (m *Memory) Body(key string) ([]byte, bool) {
 	obj, ok := m.objects[key]
 
 	return obj.body, ok
+}
+
+// StatCount is how many times Stat has been called.
+func (m *Memory) StatCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.stats
 }
 
 // Keys returns every stored key, sorted.

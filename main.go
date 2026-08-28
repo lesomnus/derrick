@@ -29,6 +29,7 @@ usage:
   derrick copy [flags] <source-image> s3://<bucket>/<repository>:<tag>
   derrick mirror [flags] <source-registry>[/<prefix>] s3://<bucket>
   derrick verify [flags] s3://<bucket>/<repository>:<tag>
+  derrick verify [flags] s3://<bucket>[/<prefix>]
   derrick untag [flags] s3://<bucket>/<repository>:<tag>
   derrick prune [flags] s3://<bucket>/<repository>
   derrick version
@@ -53,6 +54,9 @@ examples:
     --endpoint https://<account>.r2.cloudflarestorage.com
 
   derrick verify s3://registry-hday-io/robot/perception:1.4.2 \
+    --endpoint https://<account>.r2.cloudflarestorage.com
+
+  derrick verify s3://registry-hday-io/dist \
     --endpoint https://<account>.r2.cloudflarestorage.com
 `
 
@@ -247,7 +251,11 @@ func runCopy(ctx context.Context, args []string) error {
 
 func runVerify(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
-	var store storeFlags
+	var (
+		store    storeFlags
+		parallel = fs.Int("parallel", 4, "how many tags to walk at once, when walking more than one")
+		quiet    = fs.Bool("quiet", false, "only report the outcome")
+	)
 	store.bind(fs)
 	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
 
@@ -257,10 +265,21 @@ func runVerify(ctx context.Context, args []string) error {
 	if fs.NArg() != 1 {
 		fs.Usage()
 
-		return errors.New("verify takes a destination")
+		return errors.New("verify takes a tag, a repository or a bucket")
 	}
 
-	ref, err := target.Parse(fs.Arg(0))
+	// A target that names a tag asks about that tag; anything else is a
+	// prefix, and asks about everything published under it. One rule, and no
+	// guessing about whether `dist` is a repository or the six under it.
+	if namesATag(fs.Arg(0)) {
+		return verifyTag(ctx, &store, fs.Arg(0))
+	}
+
+	return verifyEverything(ctx, &store, fs.Arg(0), *parallel, logger(*quiet))
+}
+
+func verifyTag(ctx context.Context, store *storeFlags, argument string) error {
+	ref, err := target.Parse(argument)
 	if err != nil {
 		return err
 	}
@@ -293,6 +312,75 @@ func runVerify(ctx context.Context, args []string) error {
 	fmt.Printf("  %d manifests, %d blobs, %d referrers\n", report.Manifests, report.Blobs, report.Referrers)
 
 	return nil
+}
+
+func verifyEverything(ctx context.Context, store *storeFlags, argument string, parallel int, log copier.Logger) error {
+	bucket, prefix, err := parsePrefix(argument)
+	if err != nil {
+		return err
+	}
+
+	st, err := store.open(ctx, bucket)
+	if err != nil {
+		return err
+	}
+
+	s := &verify.Survey{
+		Store:    st,
+		Prefix:   prefix,
+		Parallel: parallel,
+		Log:      log,
+	}
+
+	report, err := s.Run(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(argument)
+	fmt.Printf("  repositories  %d\n", report.Repositories)
+	fmt.Printf("  tags          %d\n", report.Tags)
+	fmt.Printf("  complete      %d\n", report.Complete)
+	fmt.Printf("  objects       %d distinct\n", report.Objects)
+	fmt.Printf("  incomplete    %d\n", len(report.Incomplete))
+
+	if report.OK() {
+		return nil
+	}
+
+	for _, bad := range report.Incomplete {
+		fmt.Fprintf(os.Stderr, "  - %s\n", bad.Tag)
+	}
+
+	return fmt.Errorf("%d of %d tags are not servable", len(report.Incomplete), report.Tags)
+}
+
+// namesATag reports whether a target names one tag rather than a prefix.
+func namesATag(s string) bool {
+	rest, ok := strings.CutPrefix(s, target.Scheme)
+	if !ok {
+		return false
+	}
+
+	_, path, ok := strings.Cut(rest, "/")
+
+	return ok && strings.Contains(path, ":")
+}
+
+// parsePrefix reads a target that names a bucket and, optionally, a prefix
+// inside it.
+func parsePrefix(s string) (string, string, error) {
+	rest, ok := strings.CutPrefix(s, target.Scheme)
+	if !ok {
+		return "", "", fmt.Errorf("target %q must begin with %s", s, target.Scheme)
+	}
+
+	bucket, prefix, _ := strings.Cut(rest, "/")
+	if bucket == "" {
+		return "", "", fmt.Errorf("target %q must name a bucket, as %s<bucket>[/<prefix>]", s, target.Scheme)
+	}
+
+	return bucket, strings.Trim(prefix, "/"), nil
 }
 
 // stringList collects a flag that may be given more than once.

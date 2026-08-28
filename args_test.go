@@ -176,3 +176,55 @@ func TestParseRepository(t *testing.T) {
 		})
 	}
 }
+
+func TestNamesATag(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{in: "s3://registry-hday-io/dist/perception:1.4.2", want: true},
+		{in: "s3://registry-hday-io/dist/perception", want: false},
+		{in: "s3://registry-hday-io/dist", want: false},
+		{in: "s3://registry-hday-io", want: false},
+		// A colon in the bucket is not a tag, and a bucket cannot hold one
+		// anyway; what matters is that this does not read as a reference.
+		{in: "s3://registry-hday-io/", want: false},
+	} {
+		if got := namesATag(tc.in); got != tc.want {
+			t.Errorf("namesATag(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestParsePrefix(t *testing.T) {
+	for _, tc := range []struct {
+		in     string
+		bucket string
+		prefix string
+		bad    bool
+	}{
+		{in: "s3://registry-hday-io", bucket: "registry-hday-io"},
+		{in: "s3://registry-hday-io/", bucket: "registry-hday-io"},
+		{in: "s3://registry-hday-io/dist", bucket: "registry-hday-io", prefix: "dist"},
+		{in: "s3://registry-hday-io/dist/perception/", bucket: "registry-hday-io", prefix: "dist/perception"},
+		{in: "registry-hday-io/dist", bad: true},
+		{in: "s3://", bad: true},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			bucket, prefix, err := parsePrefix(tc.in)
+			if tc.bad {
+				if err == nil {
+					t.Fatalf("parsePrefix(%q) was accepted as %q, %q", tc.in, bucket, prefix)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("parsePrefix(%q): %v", tc.in, err)
+			}
+			if bucket != tc.bucket || prefix != tc.prefix {
+				t.Errorf("parsePrefix(%q) = %q, %q, want %q, %q", tc.in, bucket, prefix, tc.bucket, tc.prefix)
+			}
+		})
+	}
+}

@@ -76,6 +76,7 @@ go install github.com/lesomnus/derrick@latest
 derrick copy [flags] <source-image> s3://<bucket>/<repository>:<tag>
 derrick mirror [flags] <source-registry>[/<prefix>] s3://<bucket>
 derrick verify [flags] s3://<bucket>/<repository>:<tag>
+derrick verify [flags] s3://<bucket>[/<prefix>]
 derrick untag [flags] s3://<bucket>/<repository>:<tag>
 derrick prune [flags] s3://<bucket>/<repository>
 derrick version
@@ -111,6 +112,30 @@ s3://my-registry-bucket/robot/perception:1.4.2 is complete at sha256:9f86d0…
 A publish that stopped halfway looks healthy from the outside until something
 pulls the layer that is missing. On a robot fleet that is a bad place to find
 out.
+
+A target that does not name a tag is a prefix, and asks the same question of
+everything published under it:
+
+```bash
+$ derrick verify s3://my-registry-bucket/dist --endpoint ...
+s3://my-registry-bucket/dist
+  repositories  6
+  tags          182
+  complete      181
+  objects       2604 distinct
+  incomplete    1
+  - dist/firmware:dev-89b4416d
+```
+
+One tag answers "did this publish land", which the publisher already knows.
+A prefix answers the question worth asking of a registry a fleet pulls from —
+is everything that is tagged still pullable — and that is not something a
+publisher can know, because the ways it stops being true happen afterwards.
+
+It reads only the bucket, and asks about each object once rather than once per
+tag that references it. Tags of a repository share nearly all of their layers,
+so that is the difference between a walk and a very long walk: a hundred tags
+over sixty blobs is six thousand questions about a few hundred objects.
 
 ### mirror
 
