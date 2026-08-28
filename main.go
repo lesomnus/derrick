@@ -16,8 +16,10 @@ import (
 
 	"github.com/lesomnus/derrick/internal/blobstore"
 	"github.com/lesomnus/derrick/internal/copier"
+	"github.com/lesomnus/derrick/internal/layout"
 	"github.com/lesomnus/derrick/internal/ledger"
 	"github.com/lesomnus/derrick/internal/mirror"
+	"github.com/lesomnus/derrick/internal/pruner"
 	"github.com/lesomnus/derrick/internal/source"
 	"github.com/lesomnus/derrick/internal/target"
 	"github.com/lesomnus/derrick/internal/verify"
@@ -29,6 +31,8 @@ usage:
   derrick copy [flags] <source-image> s3://<bucket>/<repository>:<tag>
   derrick mirror [flags] <source-registry>[/<prefix>] s3://<bucket>
   derrick verify [flags] s3://<bucket>/<repository>:<tag>
+  derrick untag [flags] s3://<bucket>/<repository>:<tag>
+  derrick prune [flags] s3://<bucket>/<repository>
   derrick ledger [flags] s3://<bucket>
   derrick version
 
@@ -84,6 +88,10 @@ func run(ctx context.Context, args []string) error {
 		return runMirror(ctx, args[1:])
 	case "verify":
 		return runVerify(ctx, args[1:])
+	case "untag":
+		return runUntag(ctx, args[1:])
+	case "prune":
+		return runPrune(ctx, args[1:])
 	case "ledger":
 		return runLedger(ctx, args[1:])
 	case "version":
@@ -162,7 +170,7 @@ func (f *storeFlags) bind(fs *flag.FlagSet) {
 	fs.IntVar(&f.concurrency, "concurrency", 4, "how many objects to transfer at once")
 }
 
-func (f *storeFlags) open(ctx context.Context, bucket string) (blobstore.Store, error) {
+func (f *storeFlags) open(ctx context.Context, bucket string) (blobstore.Bucket, error) {
 	return blobstore.NewS3(ctx, blobstore.S3Config{
 		Bucket:      bucket,
 		Endpoint:    f.endpoint,
@@ -313,6 +321,7 @@ func runMirror(ctx context.Context, args []string) error {
 		excludeRepos stringList
 		excludeTags  stringList
 		parallel     = fs.Int("parallel", 4, "how many tags of one repository to examine at once")
+		prune        = fs.Bool("prune", false, "remove destination tags the source no longer has")
 		recheck      = fs.Bool("recheck", false, "confirm every recorded tag against the bucket instead of trusting the ledger")
 		noLedger     = fs.Bool("no-ledger", false, "examine every tag against the bucket and record nothing")
 		ledgerKey    = fs.String("ledger", ledger.DefaultKey, "key the ledger is stored under, in the destination bucket")
@@ -374,6 +383,7 @@ func runMirror(ctx context.Context, args []string) error {
 		Bucket:              bucket,
 		Prefix:              prefix,
 		Ledger:              book,
+		Prune:               *prune,
 		Recheck:             *recheck,
 		ExcludeRepositories: excludeRepos,
 		ExcludeTags:         excludeTags,
@@ -401,6 +411,9 @@ func runMirror(ctx context.Context, args []string) error {
 	fmt.Printf("  copied        %d (%d blobs, %s)\n", result.Copied, result.BlobsUploaded, copier.HumanBytes(result.BytesUploaded))
 	fmt.Printf("  skipped       %d\n", result.Skipped)
 	fmt.Printf("  excluded      %d\n", result.Excluded)
+	if *prune {
+		fmt.Printf("  pruned        %d tags no longer in the source\n", result.Pruned)
+	}
 	if result.Vanished > 0 {
 		fmt.Printf("  vanished      %d\n", result.Vanished)
 	}
@@ -489,6 +502,158 @@ func runLedger(ctx context.Context, args []string) error {
 	flush()
 
 	return nil
+}
+
+func runUntag(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("untag", flag.ContinueOnError)
+	var (
+		store     storeFlags
+		ledgerKey = fs.String("ledger", ledger.DefaultKey, "key the ledger is stored under")
+		noLedger  = fs.Bool("no-ledger", false, "do not update the ledger")
+	)
+	store.bind(fs)
+	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
+
+	if err := fs.Parse(reorder(fs, args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+
+		return errors.New("untag takes a reference")
+	}
+
+	ref, err := target.Parse(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	st, err := store.open(ctx, ref.Bucket)
+	if err != nil {
+		return err
+	}
+
+	key := layout.ManifestKey(ref.Repository, ref.Tag)
+
+	obj, err := st.Stat(ctx, key)
+	if err != nil {
+		return err
+	}
+	if obj == nil {
+		return fmt.Errorf("%s is not tagged in this bucket", ref)
+	}
+	was := obj.Metadata[layout.DigestMetadataKey]
+
+	if err := st.Delete(ctx, key); err != nil {
+		return err
+	}
+
+	// The ledger says this tag is published. Leaving that behind would make
+	// the next mirror skip it, and the next --recheck put it back.
+	if !*noLedger {
+		book, err := ledger.Load(ctx, st, *ledgerKey)
+		if err != nil {
+			return err
+		}
+		book.Forget(ref.Repository, ref.Tag)
+		if _, err := book.Save(ctx, st, *ledgerKey); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("untagged %s\n", ref)
+	if was != "" {
+		fmt.Printf("  it pointed at %s, which is still pullable by digest\n", was)
+	}
+	fmt.Printf("  the manifests and blobs under it are still there; `derrick prune s3://%s/%s` is what reclaims them\n",
+		ref.Bucket, ref.Repository)
+
+	return nil
+}
+
+func runPrune(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ContinueOnError)
+	var (
+		store storeFlags
+		grace = fs.Duration("older-than", pruner.DefaultGrace, "how long an object must have been unreferenced before it is deleted")
+		apply = fs.Bool("apply", false, "actually delete; without it nothing is written")
+		quiet = fs.Bool("quiet", false, "only report the outcome")
+	)
+	store.bind(fs)
+	fs.Usage = func() { fmt.Print(usage); fs.PrintDefaults() }
+
+	if err := fs.Parse(reorder(fs, args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+
+		return errors.New("prune takes a repository")
+	}
+
+	bucket, repository, err := parseRepository(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	st, err := store.open(ctx, bucket)
+	if err != nil {
+		return err
+	}
+
+	p := &pruner.Pruner{
+		Store:      st,
+		Repository: repository,
+		Grace:      *grace,
+		Apply:      *apply,
+		Log:        logger(*quiet),
+	}
+
+	result, err := p.Run(ctx)
+	if err != nil {
+		return err
+	}
+
+	verb := "would delete"
+	if *apply {
+		verb = "deleted"
+	}
+
+	fmt.Printf("%s%s/%s\n", target.Scheme, bucket, repository)
+	fmt.Printf("  reachable     %d manifests, %d blobs, %d referrers from %d tags\n",
+		result.Reachable.Manifests, result.Reachable.Blobs, result.Reachable.Referrers, result.Tags)
+	fmt.Printf("  %-13s %d manifests, %d blobs, %d referrers (%s)\n", verb,
+		result.Deleted.Manifests, result.Deleted.Blobs, result.Deleted.Referrers, copier.HumanBytes(result.BytesFreed))
+	if result.Withheld.Total() > 0 {
+		fmt.Printf("  held back     %d objects, unreferenced but younger than %s\n", result.Withheld.Total(), *grace)
+	}
+	if len(result.Unknown) > 0 {
+		fmt.Printf("  left alone    %d keys this layout does not describe\n", len(result.Unknown))
+	}
+	if !*apply && result.Deleted.Total() > 0 {
+		fmt.Println("\nNothing was written. Pass --apply to delete.")
+	}
+
+	return nil
+}
+
+// parseRepository reads a destination that names a repository and no tag.
+func parseRepository(s string) (string, string, error) {
+	rest, ok := strings.CutPrefix(s, target.Scheme)
+	if !ok {
+		return "", "", fmt.Errorf("target %q must begin with %s", s, target.Scheme)
+	}
+
+	bucket, repository, _ := strings.Cut(rest, "/")
+	repository = strings.Trim(repository, "/")
+	if bucket == "" || repository == "" {
+		return "", "", fmt.Errorf("target %q must name a bucket and a repository, as %s<bucket>/<repository>", s, target.Scheme)
+	}
+	if strings.Contains(repository, ":") {
+		return "", "", fmt.Errorf("target %q names a tag; prune reclaims what a whole repository no longer points at, and `derrick untag` is what removes a tag", s)
+	}
+
+	return bucket, repository, nil
 }
 
 // parseMirrorSource splits a mirror source into the registry it names and the

@@ -18,6 +18,10 @@ import (
 )
 
 // Logger receives progress. A nil Logger on a Copier discards it.
+//
+// It is called from several goroutines at once, because blobs upload in
+// parallel. Writing to a file or to standard error is fine; a Logger that
+// accumulates has to do its own locking.
 type Logger func(format string, args ...any)
 
 // Source is the registry a copy reads from.

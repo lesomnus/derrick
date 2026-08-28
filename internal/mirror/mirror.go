@@ -89,6 +89,14 @@ type Mirror struct {
 	// against the destination on every run, which is correct and slow.
 	Ledger *ledger.Ledger
 
+	// Prune removes destination tags the source no longer has.
+	//
+	// It removes the tag object and nothing else. What the tag was holding up
+	// may still be reachable from another tag, and deciding that is a question
+	// about the whole repository — which is `derrick prune`, deliberately a
+	// separate command with its own grace period.
+	Prune bool
+
 	// Recheck verifies a ledger entry against the bucket instead of trusting
 	// it. The ledger is a cache of what this tool did, and something else can
 	// have happened to the bucket since — an object deleted by hand, a
@@ -115,6 +123,9 @@ type Mirror struct {
 	CosignTags  string
 	Verify      bool
 
+	// Log is called from several goroutines at once, for the same reason
+	// copier.Logger is, and with the tags of one repository in flight on top
+	// of that.
 	Log copier.Logger
 }
 
@@ -125,6 +136,10 @@ type Result struct {
 
 	Copied  int
 	Skipped int
+
+	// Pruned counts destination tags removed because the source no longer has
+	// them.
+	Pruned int
 
 	// Excluded counts what was passed over rather than examined: repositories
 	// an exclusion pattern matched, and tags that were excluded, were named
@@ -167,6 +182,9 @@ func (m *Mirror) Run(ctx context.Context) (*Result, error) {
 	}
 	if err := validatePatterns(m.ExcludeTags); err != nil {
 		return nil, fmt.Errorf("--exclude-tag: %w", err)
+	}
+	if _, ok := m.Store.(blobstore.Bucket); m.Prune && !ok {
+		return nil, errors.New("--prune needs a store that can list and delete")
 	}
 
 	log := m.logger()
@@ -246,6 +264,10 @@ func (m *Mirror) mirrorRepository(ctx context.Context, repository string, result
 		outcomes[i] = m.mirrorTag(ctx, repo, repository, tag)
 	})
 
+	if m.Prune {
+		m.pruneVanishedTags(ctx, repository, listed, result)
+	}
+
 	for i, o := range outcomes[:attempted] {
 		switch {
 		case o.err != nil:
@@ -269,6 +291,71 @@ func (m *Mirror) mirrorRepository(ctx context.Context, repository string, result
 	}
 
 	return nil
+}
+
+// pruneVanishedTags removes destination tags the source no longer lists.
+//
+// The comparison is against everything the source listed, not against the tags
+// this run copied. An attachment tag was published by the copier rather than
+// walked, and an excluded tag is one we chose not to publish rather than one
+// that should be taken away; pruning against the filtered list would delete
+// every signature in the repository on the first run.
+func (m *Mirror) pruneVanishedTags(ctx context.Context, repository string, listed []string, result *Result) {
+	log := m.logger()
+
+	if len(listed) == 0 {
+		// A registry that answers with nothing looks exactly like a registry
+		// whose repository is empty, and one of those is a reason to delete
+		// every tag we have. Refuse to tell them apart.
+		log("warning: %s listed no tags at all, so nothing is being pruned from it", repository)
+
+		return
+	}
+
+	bucket, ok := m.Store.(blobstore.Bucket)
+	if !ok {
+		return
+	}
+
+	source := make(map[string]bool, len(listed))
+	for _, tag := range listed {
+		source[tag] = true
+	}
+
+	prefix := layout.ManifestKey(repository, "")
+
+	var stale []string
+	if err := bucket.List(ctx, prefix, func(entry blobstore.Entry) error {
+		reference := strings.TrimPrefix(entry.Key, prefix)
+		if strings.Contains(reference, "/") || layout.IsDigest(reference) || source[reference] {
+			return nil
+		}
+
+		stale = append(stale, reference)
+
+		return nil
+	}); err != nil {
+		result.Failures = append(result.Failures, Failure{Repository: repository, Err: err})
+
+		return
+	}
+
+	for _, tag := range stale {
+		log("%s:%s is no longer in the source; removing the tag", repository, tag)
+		result.Pruned++
+
+		if m.DryRun {
+			continue
+		}
+		if err := bucket.Delete(ctx, layout.ManifestKey(repository, tag)); err != nil {
+			result.Failures = append(result.Failures, Failure{Repository: repository, Tag: tag, Err: err})
+
+			continue
+		}
+		if m.Ledger != nil {
+			m.Ledger.Forget(repository, tag)
+		}
+	}
 }
 
 type outcome struct {

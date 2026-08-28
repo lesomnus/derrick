@@ -133,6 +133,51 @@ func (s *S3) Put(ctx context.Context, key string, body io.Reader, opts PutOption
 	return nil
 }
 
+func (s *S3) List(ctx context.Context, prefix string, fn func(Entry) error) error {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("list %q: %w", prefix, err)
+		}
+
+		for _, object := range page.Contents {
+			entry := Entry{Key: aws.ToString(object.Key)}
+			if object.Size != nil {
+				entry.Size = *object.Size
+			}
+			if object.LastModified != nil {
+				entry.Modified = *object.LastModified
+			}
+
+			if err := fn(entry); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *S3) Delete(ctx context.Context, key string) error {
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+
+		return fmt.Errorf("delete %q: %w", key, err)
+	}
+
+	return nil
+}
+
 func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),

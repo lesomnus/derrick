@@ -142,3 +142,37 @@ func TestParseBucket(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRepository(t *testing.T) {
+	for _, tc := range []struct {
+		in         string
+		bucket     string
+		repository string
+		bad        bool
+	}{
+		{in: "s3://registry-hday-io/dist/perception", bucket: "registry-hday-io", repository: "dist/perception"},
+		{in: "s3://registry-hday-io/dist/perception/", bucket: "registry-hday-io", repository: "dist/perception"},
+		{in: "s3://registry-hday-io/dist", bucket: "registry-hday-io", repository: "dist"},
+		// Pruning is a question about a repository; removing a tag is `untag`.
+		{in: "s3://registry-hday-io/dist/perception:1.4.2", bad: true},
+		{in: "s3://registry-hday-io", bad: true},
+		{in: "registry-hday-io/dist", bad: true},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			bucket, repository, err := parseRepository(tc.in)
+			if tc.bad {
+				if err == nil {
+					t.Fatalf("parseRepository(%q) was accepted as %q, %q", tc.in, bucket, repository)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseRepository(%q): %v", tc.in, err)
+			}
+			if bucket != tc.bucket || repository != tc.repository {
+				t.Errorf("parseRepository(%q) = %q, %q, want %q, %q", tc.in, bucket, repository, tc.bucket, tc.repository)
+			}
+		})
+	}
+}

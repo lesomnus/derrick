@@ -7,7 +7,9 @@ import (
 	"io"
 	"maps"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 )
 
 // Memory is a Store held in memory.
@@ -22,12 +24,20 @@ type Memory struct {
 
 	// Writes records the key of every Put in the order it happened.
 	Writes []string
+
+	// Deletes records the key of every Delete in the order it happened.
+	Deletes []string
+
+	// Clock stamps an object's modification time. Reclaiming space turns on
+	// how old an object is, so a test needs to be able to say.
+	Clock func() time.Time
 }
 
 type memoryObject struct {
 	body        []byte
 	contentType string
 	metadata    map[string]string
+	modified    time.Time
 }
 
 // NewMemory returns an empty in-memory store.
@@ -64,6 +74,7 @@ func (m *Memory) Put(_ context.Context, key string, body io.Reader, opts PutOpti
 		body:        raw,
 		contentType: opts.ContentType,
 		metadata:    maps.Clone(opts.Metadata),
+		modified:    m.now(),
 	}
 	m.Writes = append(m.Writes, key)
 
@@ -80,6 +91,66 @@ func (m *Memory) Get(_ context.Context, key string) (io.ReadCloser, error) {
 	}
 
 	return io.NopCloser(bytes.NewReader(obj.body)), nil
+}
+
+func (m *Memory) List(_ context.Context, prefix string, fn func(Entry) error) error {
+	m.mu.Lock()
+	entries := make([]Entry, 0, len(m.objects))
+	for key, obj := range m.objects {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		entries = append(entries, Entry{Key: key, Size: int64(len(obj.body)), Modified: obj.modified})
+	}
+	m.mu.Unlock()
+
+	// Sorted, because a real store lists in key order and a walk that depends
+	// on map iteration order would pass here and fail there.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+
+	for _, entry := range entries {
+		if err := fn(entry); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *Memory) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.objects[key]; !ok {
+		return nil
+	}
+
+	delete(m.objects, key)
+	m.Deletes = append(m.Deletes, key)
+
+	return nil
+}
+
+// SetModified backdates an object, so that a grace period can be tested
+// without waiting one out.
+func (m *Memory) SetModified(key string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	obj, ok := m.objects[key]
+	if !ok {
+		return
+	}
+	obj.modified = at
+	m.objects[key] = obj
+}
+
+func (m *Memory) now() time.Time {
+	if m.Clock != nil {
+		return m.Clock()
+	}
+
+	return time.Now()
 }
 
 // Body returns the stored bytes at key, and whether it exists.

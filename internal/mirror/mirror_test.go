@@ -514,3 +514,153 @@ func TestDryRunWritesNothing(t *testing.T) {
 		t.Fatal("a dry run recorded a tag it did not copy")
 	}
 }
+
+// remove deletes a tag from the source, the way a registry's own retention
+// would.
+func (f *fakeRepository) remove(tag string) {
+	delete(f.byTag, tag)
+}
+
+func TestPruneRemovesATagTheSourceNoLongerHas(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.1", "1.4.2")
+
+	store := blobstore.NewMemory()
+	book := ledger.New()
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+
+	repo.remove("1.4.1")
+
+	result := run(t, &mirror.Mirror{
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book, Prune: true,
+	})
+
+	if result.Pruned != 1 {
+		t.Fatalf("pruned %d tags, want 1", result.Pruned)
+	}
+	if _, ok := store.Body("dist/perception/manifests/1.4.1"); ok {
+		t.Error("the tag object is still in the bucket")
+	}
+	if _, ok := store.Body("dist/perception/manifests/1.4.2"); !ok {
+		t.Error("the tag that is still in the source was pruned")
+	}
+
+	// Leaving the entry behind would make the next run skip a tag that is not
+	// there, and the next --recheck put it back.
+	if _, ok := book.Lookup("dist/perception", "1.4.1"); ok {
+		t.Error("the ledger still records the pruned tag")
+	}
+
+	// Only the tag object goes. What it was holding up is a question about the
+	// whole repository, which is what `derrick prune` answers.
+	var manifests int
+	for _, key := range store.Keys() {
+		if strings.Contains(key, "/manifests/sha256:") {
+			manifests++
+		}
+	}
+	if manifests != 2 {
+		t.Errorf("the bucket holds %d manifests, want both: pruning a tag is not pruning an image", manifests)
+	}
+}
+
+func TestPruneLeavesAttachmentTagsAlone(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.2")
+	subject := repo.byTag["1.4.2"]
+	signature := strings.Replace(subject.Digest, ":", "-", 1) + ".sig"
+	repo.tag(t, signature, "a-signature")
+
+	store := blobstore.NewMemory()
+	book := ledger.New()
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+
+	result := run(t, &mirror.Mirror{
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book, Prune: true,
+	})
+
+	// The copier published it, the walk skipped it, and the source still has
+	// it. Comparing against the tags this run copied rather than against the
+	// source listing would delete every signature in the repository.
+	if result.Pruned != 0 {
+		t.Errorf("pruned %d tags, want 0", result.Pruned)
+	}
+	if _, ok := store.Body("dist/perception/manifests/" + signature); !ok {
+		t.Error("the signature tag was pruned")
+	}
+}
+
+func TestPruneLeavesAnExcludedTagAlone(t *testing.T) {
+	registry := newFakeRegistry()
+	registry.repository(t, "dist/perception", "1.4.2", "r0")
+
+	store := blobstore.NewMemory()
+	book := ledger.New()
+
+	// Published before anybody decided not to publish it.
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+
+	result := run(t, &mirror.Mirror{
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book,
+		Prune: true, ExcludeTags: []string{"r0"},
+	})
+
+	// Excluding a tag says do not publish it, not take it away. `derrick
+	// untag` is what takes it away.
+	if result.Pruned != 0 {
+		t.Errorf("pruned %d tags, want 0", result.Pruned)
+	}
+	if _, ok := store.Body("dist/perception/manifests/r0"); !ok {
+		t.Error("an excluded tag was pruned")
+	}
+}
+
+func TestPruneRefusesWhenTheSourceListsNothing(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.2")
+
+	store := blobstore.NewMemory()
+	book := ledger.New()
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+
+	// A registry answering with nothing looks exactly like a repository that
+	// is empty, and one of those is a reason to delete every tag we have.
+	repo.remove("1.4.2")
+
+	result := run(t, &mirror.Mirror{
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book, Prune: true,
+	})
+
+	if result.Pruned != 0 {
+		t.Errorf("pruned %d tags from a repository that listed none, want 0", result.Pruned)
+	}
+	if _, ok := store.Body("dist/perception/manifests/1.4.2"); !ok {
+		t.Error("a tag was pruned on the word of an empty listing")
+	}
+}
+
+func TestADryRunPrunesNothing(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.1", "1.4.2")
+
+	store := blobstore.NewMemory()
+	book := ledger.New()
+	run(t, &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book})
+
+	repo.remove("1.4.1")
+
+	result := run(t, &mirror.Mirror{
+		Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", Ledger: book,
+		Prune: true, DryRun: true,
+	})
+
+	if result.Pruned != 1 {
+		t.Fatalf("reported %d tags to prune, want 1", result.Pruned)
+	}
+	if _, ok := store.Body("dist/perception/manifests/1.4.1"); !ok {
+		t.Error("a dry run deleted the tag object")
+	}
+	if _, ok := book.Lookup("dist/perception", "1.4.1"); !ok {
+		t.Error("a dry run changed the ledger")
+	}
+}

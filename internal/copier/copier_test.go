@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lesomnus/derrick/internal/blobstore"
@@ -560,19 +562,21 @@ func TestTheLogAccountsForEveryBlob(t *testing.T) {
 	root := src.image(t, "layer-one", "layer-two")
 	src.byTag["1.4.2"] = root
 
-	var lines []string
+	log := &recorder{}
 	newCopier := func() *copier.Copier {
 		return &copier.Copier{
 			Source:     src,
 			Store:      store,
 			Repository: repository,
-			Log:        func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) },
+			Log:        log.Log,
 		}
 	}
 
 	if _, err := newCopier().Run(context.Background(), root, "1.4.2"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+
+	lines := log.lines()
 
 	uploaded := count(lines, "uploaded in")
 	if uploaded != 3 {
@@ -582,10 +586,11 @@ func TestTheLogAccountsForEveryBlob(t *testing.T) {
 		t.Errorf("the first copy reported %d objects already present, want 0", got)
 	}
 
-	lines = nil
+	log.reset()
 	if _, err := newCopier().Run(context.Background(), root, "1.4.2"); err != nil {
 		t.Fatalf("Run again: %v", err)
 	}
+	lines = log.lines()
 
 	// The point of saying so: a re-run that copies nothing should look like a
 	// re-run that copied nothing, not like one that did not happen.
@@ -607,17 +612,19 @@ func TestADryRunSaysItWouldUpload(t *testing.T) {
 	root := src.image(t, "layer-one")
 	src.byTag["1.4.2"] = root
 
-	var lines []string
+	log := &recorder{}
 	c := &copier.Copier{
 		Source:     src,
 		Store:      store,
 		Repository: repository,
 		DryRun:     true,
-		Log:        func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) },
+		Log:        log.Log,
 	}
 	if _, err := c.Run(context.Background(), root, "1.4.2"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+
+	lines := log.lines()
 
 	if got := count(lines, "would upload"); got != 2 {
 		t.Errorf("a dry run reported %d blobs it would upload, want 2:\n%s", got, strings.Join(lines, "\n"))
@@ -625,6 +632,34 @@ func TestADryRunSaysItWouldUpload(t *testing.T) {
 	if got := count(lines, "uploaded in"); got != 0 {
 		t.Errorf("a dry run claimed to have uploaded %d blobs", got)
 	}
+}
+
+// recorder is a Logger that keeps what it was told. It locks because a Logger
+// is called from every goroutine uploading a blob.
+type recorder struct {
+	mu    sync.Mutex
+	taken []string
+}
+
+func (r *recorder) Log(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.taken = append(r.taken, fmt.Sprintf(format, args...))
+}
+
+func (r *recorder) lines() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return slices.Clone(r.taken)
+}
+
+func (r *recorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.taken = nil
 }
 
 func count(lines []string, substring string) int {

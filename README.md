@@ -76,6 +76,8 @@ go install github.com/lesomnus/derrick@latest
 derrick copy [flags] <source-image> s3://<bucket>/<repository>:<tag>
 derrick mirror [flags] <source-registry>[/<prefix>] s3://<bucket>
 derrick verify [flags] s3://<bucket>/<repository>:<tag>
+derrick untag [flags] s3://<bucket>/<repository>:<tag>
+derrick prune [flags] s3://<bucket>/<repository>
 derrick ledger [flags] s3://<bucket>
 derrick version
 ```
@@ -132,6 +134,7 @@ destination is a bucket and not a reference — there is nothing else to say.
 | `--parallel` | tags of one repository examined at once, default 4 |
 | `--exclude-repository` | `path.Match` pattern not to mirror; repeatable |
 | `--exclude-tag` | same, for tags |
+| `--prune` | remove destination tags the source no longer has |
 | `--recheck` | confirm every recorded tag against the bucket |
 | `--no-ledger` | examine every tag against the bucket and record nothing |
 | `--ledger` | key the ledger is stored under |
@@ -197,6 +200,64 @@ eventually describe something else. The leading underscore is what keeps it out
 of the way: a repository name may not begin with one, so no image can collide
 with that key and no route a serverless-registry serves can be made to read it.
 
+### untag and prune
+
+Removing an image is two operations, because it is two questions.
+
+`untag` answers the first: this tag should not be pullable any more.
+
+```bash
+derrick untag s3://my-registry-bucket/dist/perception:1.4.1 --endpoint ...
+```
+
+It deletes the one object the tag is, which is atomic from a client's point of
+view in the same way publishing it was. The image stays pullable by digest and
+by any other tag pointing at it, and the ledger entry goes with the tag — left
+behind, it would make the next mirror skip a tag that is not there and the
+next `--recheck` put it back.
+
+`prune` answers the second: what in this repository is now holding up nothing.
+
+```bash
+derrick prune s3://my-registry-bucket/dist/perception --endpoint ...      # reports
+derrick prune s3://my-registry-bucket/dist/perception --endpoint ... --apply
+```
+
+It walks out from every tag — through indexes to their architectures, through
+manifests to their blobs, and through referrers to the signatures hanging off
+what it reached — and deletes what it never arrived at. It reports without
+`--apply`, because it is the one command here that can lose an image.
+
+Three of its rules are the reason it is a command rather than a shell loop:
+
+**Unreferenced is not the same as garbage.** A publish writes blobs, then
+manifests, then the tag; halfway through, an image arriving looks exactly like
+one abandoned. So an object is deleted only once it has been unreferenced for
+longer than a publish plausibly takes — `--older-than`, a day by default.
+
+**A repository with no tags is left alone.** Everything in it is unreachable by
+definition, and a repository whose images are pulled by digest is a thing
+people have on purpose. Deleting a repository is not something to arrive at by
+inference.
+
+**A manifest that is referenced but missing stops the run.** Its blobs look
+like garbage from the outside, and deleting them would turn a half-finished
+publish into a lost image. Fix it — `derrick verify` says what is missing — and
+prune afterwards.
+
+Keys the layout does not describe are never deleted. Something else wrote them,
+and this does not know what for.
+
+`mirror --prune` is the first of these two, applied to what the source no
+longer has: a tag in the bucket that the source registry does not list is
+removed. It compares against everything the source listed rather than against
+what the run copied, because an attachment tag was published by the copier
+without being walked, and an excluded tag is one you chose not to publish
+rather than one to take away. A source repository that lists no tags at all
+prunes nothing — a registry answering with nothing looks exactly like a
+repository that is empty, and one of those is a reason to delete every tag you
+have.
+
 ### ledger
 
 `ledger` prints the ledger, which is how a human reads one without S3
@@ -247,7 +308,10 @@ side runs end to end in `go test` against a registry started in-process:
 images, multi-architecture indexes, republishing, and moving a tag. The mirror
 runs there too — cataloguing a prefix, skipping what a ledger already records —
 and its skip, adopt, moved-tag and keep-going-after-a-failure rules are unit
-tested against a stand-in registry.
+tested against a stand-in registry. The prune rules — shared layers, signatures,
+the grace period, the refusals — are tested against a bucket written by hand,
+so that what is exercised is the keys and the metadata rather than an agreement
+between the pruner and the copier.
 
 The whole path has been run once for real: a signed multi-architecture image
 copied from `cgr.dev` into a Cloudflare R2 bucket, then pulled back out through
