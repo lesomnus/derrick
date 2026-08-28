@@ -348,8 +348,10 @@ func verifyEverything(ctx context.Context, store *storeFlags, argument string, p
 		return nil
 	}
 
+	// On stdout with the counts, not on stderr with the walk: which tags are
+	// broken is the answer, and it should travel with the rest of it.
 	for _, bad := range report.Incomplete {
-		fmt.Fprintf(os.Stderr, "  - %s\n", bad.Tag)
+		fmt.Printf("  - %s\n", bad.Tag)
 	}
 
 	return fmt.Errorf("%d of %d tags are not servable", len(report.Incomplete), report.Tags)
