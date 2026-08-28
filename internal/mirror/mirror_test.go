@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -621,5 +622,73 @@ func TestADryRunPrunesNothing(t *testing.T) {
 	}
 	if _, ok := store.Body("dist/perception/manifests/1.4.1"); !ok {
 		t.Error("a dry run deleted the tag object")
+	}
+}
+
+// recorder is a Logger that keeps what it was told. It locks because a mirror
+// examines several tags at once.
+type recorder struct {
+	mu    sync.Mutex
+	taken []string
+}
+
+func (r *recorder) Log(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.taken = append(r.taken, fmt.Sprintf(format, args...))
+}
+
+func (r *recorder) text() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return strings.Join(r.taken, "\n")
+}
+
+func (r *recorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.taken = nil
+}
+
+// A run that copies nothing should say what it decided about every tag, not
+// only how many there were. The counts are the summary; the log is the record
+// of what is in the bucket and why.
+func TestEveryTagIsAccountedForInTheLog(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.1", "1.4.2", "r0")
+	subject := repo.byTag["1.4.2"]
+	signature := strings.Replace(subject.Digest, ":", "-", 1) + ".sig"
+	repo.tag(t, signature, "a-signature")
+
+	store := blobstore.NewMemory()
+	log := &recorder{}
+	newMirror := func() *mirror.Mirror {
+		return &mirror.Mirror{
+			Registry:    registry,
+			Store:       store,
+			Bucket:      "registry-test",
+			Prefix:      "dist",
+			ExcludeTags: []string{"r0"},
+			Log:         log.Log,
+		}
+	}
+
+	run(t, newMirror())
+
+	log.reset()
+	result := run(t, newMirror())
+
+	if result.Copied != 0 {
+		t.Fatalf("the second run copied %d tags, want 0", result.Copied)
+	}
+
+	text := log.text()
+	for _, tag := range []string{"1.4.1", "1.4.2", "r0", signature} {
+		if !strings.Contains(text, "dist/perception:"+tag) {
+			t.Errorf("a run that copied nothing does not account for %s:\n%s", tag, text)
+		}
 	}
 }

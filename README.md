@@ -174,6 +174,11 @@ well inside what an object store gives away, and a second or two of wall clock
 at any sane parallelism. The request that cannot be avoided either way is the
 one against the source, and it is the expensive one.
 
+Every tag is said out loud either way — copied, already present at a digest,
+attached to something else, or excluded by a pattern. A run that copies nothing
+should account for what it decided rather than report that it decided, and the
+log of one is a complete list of what is in the bucket and how it got there.
+
 ### untag and prune
 
 Removing an image is two operations, because it is two questions.

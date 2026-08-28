@@ -227,17 +227,17 @@ func (m *Mirror) mirrorRepository(ctx context.Context, repository string, result
 		return nil
 	}
 
-	tags, excluded := m.selectTags(listed)
+	log("%s: %d tags listed", repository, len(listed))
+
+	tags, excluded := m.selectTags(repository, listed)
 	result.Tags += len(tags)
 	result.Excluded += excluded
 
 	if len(tags) == 0 {
-		log("%s: nothing to mirror (%d tags listed)", repository, len(listed))
+		log("%s: nothing left to mirror", repository)
 
 		return nil
 	}
-
-	log("%s: %d tags", repository, len(tags))
 
 	outcomes := make([]outcome, len(tags))
 	attempted := eachParallel(ctx, tags, m.parallel(), func(ctx context.Context, i int, tag string) {
@@ -360,6 +360,11 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		return outcome{err: err}
 	}
 	if published {
+		// Said out loud, and not only counted. A run that copies nothing
+		// should account for every tag it decided not to copy, or the log of
+		// a steady-state run says only that the mirror ran.
+		log("%s:%s present at %s", repository, tag, digest)
+
 		return outcome{}
 	}
 
@@ -441,6 +446,7 @@ func (m *Mirror) selectRepositories(catalog []string) ([]string, int) {
 			continue
 		}
 		if matchesAny(m.ExcludeRepositories, repository) {
+			m.logger()("%s is excluded by pattern", repository)
 			excluded++
 
 			continue
@@ -453,8 +459,10 @@ func (m *Mirror) selectRepositories(catalog []string) ([]string, int) {
 	return kept, excluded
 }
 
-// selectTags keeps the tags worth copying as images of their own.
-func (m *Mirror) selectTags(listed []string) ([]string, int) {
+// selectTags keeps the tags worth copying as images of their own, saying out
+// loud what it passes over. A tag nobody can find in the log is one somebody
+// will eventually go looking for in the bucket.
+func (m *Mirror) selectTags(repository string, listed []string) ([]string, int) {
 	var (
 		kept     []string
 		excluded int
@@ -464,17 +472,20 @@ func (m *Mirror) selectTags(listed []string) ([]string, int) {
 		// subject, so copying it again as a top-level image would duplicate
 		// the work and publish a tag that means nothing here.
 		if source.IsAttachmentTag(tag) {
+			// Not lost: it comes across attached to the manifest it names.
+			m.logger()("%s:%s is an attachment; it travels with its subject", repository, tag)
 			excluded++
 
 			continue
 		}
 		if err := copier.ValidateTag(tag); err != nil {
-			m.logger()("warning: skipping tag %q: %v", tag, err)
+			m.logger()("warning: %s:%s is not a tag this bucket can hold: %v", repository, tag, err)
 			excluded++
 
 			continue
 		}
 		if matchesAny(m.ExcludeTags, tag) {
+			m.logger()("%s:%s is excluded by pattern", repository, tag)
 			excluded++
 
 			continue
