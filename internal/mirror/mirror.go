@@ -117,6 +117,10 @@ type Mirror struct {
 	Log copier.Logger
 
 	logMu sync.Mutex
+
+	// writes is Store with concurrent writes of one key folded together, set
+	// up per run. See Run.
+	writes blobstore.Store
 }
 
 // say writes one line.
@@ -224,6 +228,13 @@ func (m *Mirror) Run(ctx context.Context) (*Result, error) {
 	if _, ok := m.Store.(blobstore.Bucket); m.Prune && !ok {
 		return nil, errors.New("--prune needs a store that can list and delete")
 	}
+
+	// Images share layers, so two tags copied at once routinely try to write
+	// one blob to one key — and four tags that are the same image under
+	// different names try it four times. An object store is entitled to refuse
+	// that, and R2 does, with `429 Reduce your concurrent request rate for the
+	// same object`. One writer for the whole run folds those together.
+	m.writes = blobstore.NewSerial(m.Store, layout.ContentAddressed)
 
 	result := &Result{}
 
@@ -432,7 +443,7 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 
 	c := &copier.Copier{
 		Source:      repo,
-		Store:       m.Store,
+		Store:       m.writes,
 		Repository:  repository,
 		Concurrency: m.Concurrency,
 		DryRun:      m.DryRun,

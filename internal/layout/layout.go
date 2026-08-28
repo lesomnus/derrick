@@ -41,6 +41,16 @@ func IsDigest(reference string) bool {
 	return digestPattern.MatchString(reference)
 }
 
+// ContentAddressed reports whether the object at key is determined by the key:
+// a blob, a manifest stored under its digest, or a referrer descriptor. A
+// manifest stored under a tag is not, which is the whole reason a tag can
+// move.
+func ContentAddressed(key string) bool {
+	index := strings.LastIndex(key, "/")
+
+	return IsDigest(key[index+1:])
+}
+
 // BlobKey returns the key a blob is stored under.
 func BlobKey(repository, digest string) string {
 	return fmt.Sprintf("%s/blobs/%s", repository, digest)

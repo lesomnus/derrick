@@ -194,6 +194,14 @@ Several tags copy at once, and the blocks stay whole: each copy's log is
 collected while it runs and printed when it finishes, so the interleaving
 happens between blocks rather than inside them.
 
+Those copies share one writer, because they share layers. Two tags that are
+the same image under different names — a release and the build tag it was cut
+from — would otherwise upload every blob under them twice, at once, to the
+same key. R2 answers that with `429 Reduce your concurrent request rate for
+the same object`, and it is wasted transfer besides, so a key that is
+determined by its contents is written once per run and the rest of the callers
+find it already done.
+
 ### untag and prune
 
 Removing an image is two operations, because it is two questions.

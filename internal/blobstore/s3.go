@@ -59,6 +59,12 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 		awsconfig.WithRegion(region),
 		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+
+		// More than the SDK's three. The throttling worth riding out here is
+		// contention for one key, which resolves as soon as whoever else is
+		// writing it finishes, and three attempts is not long enough to
+		// outlast a large layer.
+		awsconfig.WithRetryMaxAttempts(8),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)

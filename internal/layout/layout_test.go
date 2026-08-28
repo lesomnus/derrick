@@ -174,3 +174,23 @@ func TestReferrerDescriptorNilWithoutSubject(t *testing.T) {
 		t.Error("a manifest with no subject refers to nothing and needs no descriptor")
 	}
 }
+
+func TestContentAddressed(t *testing.T) {
+	const digest = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{
+		{key: layout.BlobKey("dist/perception", digest), want: true},
+		{key: layout.ManifestKey("dist/perception", digest), want: true},
+		{key: layout.ReferrerKey("dist/perception", digest, digest), want: true},
+		// A tag is the one object whose bytes are not decided by its key.
+		{key: layout.ManifestKey("dist/perception", "1.4.2"), want: false},
+		{key: layout.ManifestKey("dist/perception", "latest"), want: false},
+	} {
+		if got := layout.ContentAddressed(tc.key); got != tc.want {
+			t.Errorf("ContentAddressed(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}

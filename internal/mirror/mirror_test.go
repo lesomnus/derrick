@@ -696,3 +696,43 @@ func TestEveryTagIsAccountedForInTheLog(t *testing.T) {
 		}
 	}
 }
+
+// Two tags that are the same image is the ordinary case, not a corner: a
+// release tag and the build tag it was cut from point at one manifest. Copying
+// them at once must not mean writing every blob under them twice, which an
+// object store is entitled to refuse and R2 does.
+func TestABlobSharedBetweenTagsIsWrittenOnce(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception")
+	repo.tag(t, "1.4.2", "the-same-image")
+	repo.tag(t, "stable", "the-same-image")
+	repo.tag(t, "r33152680499", "the-same-image")
+
+	store := blobstore.NewMemory()
+	run(t, &mirror.Mirror{
+		Registry: registry,
+		Store:    store,
+		Bucket:   "registry-test",
+		Prefix:   "dist",
+		Parallel: 4,
+	})
+
+	layer := layout.BlobKey("dist/perception", digestOf([]byte("the-same-image")))
+
+	written := 0
+	for _, key := range store.Writes {
+		if key == layer {
+			written++
+		}
+	}
+	if written != 1 {
+		t.Errorf("the layer under three tags was written %d times, want 1", written)
+	}
+
+	// The tags themselves are three objects, and each of them is written.
+	for _, tag := range []string{"1.4.2", "stable", "r33152680499"} {
+		if _, ok := store.Body(layout.ManifestKey("dist/perception", tag)); !ok {
+			t.Errorf("%s was not published", tag)
+		}
+	}
+}
