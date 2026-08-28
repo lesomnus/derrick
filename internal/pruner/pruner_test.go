@@ -167,6 +167,7 @@ func run(t *testing.T, b *bucket, apply bool) *pruner.Result {
 	p := &pruner.Pruner{
 		Store:      b.Memory,
 		Repository: repository,
+		Grace:      pruner.DefaultGrace,
 		Apply:      apply,
 		Now:        func() time.Time { return now },
 		Log:        func(format string, args ...any) { t.Logf(format, args...) },
@@ -361,7 +362,7 @@ func TestAMissingManifestStopsTheRun(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	p := &pruner.Pruner{Store: b.Memory, Repository: repository, Apply: true, Now: func() time.Time { return now }}
+	p := &pruner.Pruner{Store: b.Memory, Repository: repository, Grace: pruner.DefaultGrace, Apply: true, Now: func() time.Time { return now }}
 
 	before := len(b.Keys())
 	if _, err := p.Run(context.Background()); err == nil {

@@ -52,8 +52,9 @@ type Pruner struct {
 	Repository string
 
 	// Grace is how old an unreachable object must be before it is deleted.
-	// Zero means DefaultGrace; a negative value means no grace at all, which
-	// is only safe when nothing is publishing.
+	// Zero means none, which is only safe when nothing is publishing; the
+	// command line defaults it to DefaultGrace, and a caller that does not
+	// choose is choosing the dangerous one.
 	Grace time.Duration
 
 	// Apply actually deletes. Without it the run reports and writes nothing,
@@ -144,7 +145,7 @@ func (p *Pruner) Run(ctx context.Context) (*Result, error) {
 	log("%s: %d tags reach %d manifests, %d blobs and %d referrers",
 		p.Repository, len(inventory.tags), len(reachable.manifests), len(reachable.blobs), len(reachable.referrers))
 
-	cutoff := p.now().Add(-p.grace())
+	cutoff := p.now().Add(-p.Grace)
 
 	// Referrers first, then manifests, then blobs: at no point does something
 	// still present point at something already gone.
@@ -392,14 +393,6 @@ func (p *Pruner) read(ctx context.Context, key string) ([]byte, error) {
 	defer rc.Close()
 
 	return io.ReadAll(rc)
-}
-
-func (p *Pruner) grace() time.Duration {
-	if p.Grace == 0 {
-		return DefaultGrace
-	}
-
-	return p.Grace
 }
 
 func (p *Pruner) now() time.Time {
