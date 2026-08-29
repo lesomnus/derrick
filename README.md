@@ -317,19 +317,38 @@ The layout, ordering and referrer rules are covered by unit tests, and the read
 side runs end to end in `go test` against a registry started in-process:
 images, multi-architecture indexes, republishing, and moving a tag. The mirror
 runs there too — cataloguing a prefix, skipping what the bucket already has —
-and its skip, adopt, moved-tag and keep-going-after-a-failure rules are unit
-tested against a stand-in registry. The prune rules — shared layers, signatures,
-the grace period, the refusals — are tested against a bucket written by hand,
-so that what is exercised is the keys and the metadata rather than an agreement
-between the pruner and the copier.
+and its skip, moved-tag, prune and keep-going-after-a-failure rules are unit
+tested against a stand-in registry. The prune rules — shared layers,
+signatures, the grace period, the refusals — are tested against a bucket
+written by hand, so that what is exercised is the keys and the metadata rather
+than an agreement between the pruner and the copier.
 
-The whole path has been run once for real: a signed multi-architecture image
-copied from `cgr.dev` into a Cloudflare R2 bucket, then pulled back out through
-a deployed serverless-registry and checked with `validate.Index`, which
-verifies every manifest, layer and diffID. The cosign signature and attestation
-came across with it and resolve by their fallback tags.
+It has been run for real, against a zot instance and a Cloudflare R2 bucket a
+fleet pulls from:
 
-Still unexercised: **layers large enough to go multipart**. The largest blob in
-that test was 600 KB, well under the uploader's part size, so the multipart
-path has not actually run against R2. That is the next thing to try, and it is
-the one most likely to surface a checksum-header problem.
+- **A mirror of 182 tags across six repositories**, 342 MiB planned and rather
+  less moved, since tags of a repository share layers and several were the same
+  image under different names. It found a real bug doing it: four tags copying
+  at once wrote one blob to one key, and R2 answers that with `429 Reduce your
+  concurrent request rate for the same object`.
+- **A survey of everything published**, 850 distinct objects reached from 182
+  tags, complete.
+- **A multipart upload**, twelve megabytes, round-tripped byte for byte. That
+  path is a different set of API calls from a small `PutObject`, with the
+  checksum headers R2 refuses attached again per part, and nothing had reached
+  it before: every layer moved so far was under a megabyte and a half.
+  `internal/blobstore` keeps that as an integration test, skipped unless a
+  bucket is named.
+- **An untag and a prune**, on a repository of forty tags where the untagged
+  image shared all but one of its blobs with the others. It proposed the one
+  manifest and the one blob that nothing referenced, took exactly those when
+  applied, found nothing on a second pass, and left the other thirty-nine tags
+  verifying clean.
+
+Still unexercised: **a pull through a deployed serverless-registry**. Everything
+above reads and writes the bucket; whether a robot with a device token gets the
+image back out is the other half, and it is checked from the other side.
+
+Also unexercised: **layers large enough to need many parts**. Twelve megabytes
+is three parts, which proves the path exists; a two-gigabyte layer is four
+hundred, and that is a different thing to be confident about.
