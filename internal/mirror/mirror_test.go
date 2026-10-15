@@ -75,9 +75,10 @@ func (r *fakeRegistry) repository(t *testing.T, name string, tags ...string) *fa
 }
 
 type fakeRepository struct {
-	byTag    map[string]*source.Manifest
-	byDigest map[string]*source.Manifest
-	blobs    map[string][]byte
+	byTag     map[string]*source.Manifest
+	byDigest  map[string]*source.Manifest
+	blobs     map[string][]byte
+	referrers map[string][]layout.Descriptor
 
 	digests atomic.Int64 // how many times a tag was resolved
 	fetches atomic.Int64 // how many times a manifest was fetched by tag
@@ -138,8 +139,57 @@ func (f *fakeRepository) Blob(_ context.Context, digest string) (io.ReadCloser, 
 	return io.NopCloser(bytes.NewReader(body)), nil
 }
 
-func (f *fakeRepository) Referrers(context.Context, string) ([]layout.Descriptor, error) {
-	return nil, nil
+func (f *fakeRepository) Referrers(_ context.Context, digest string) ([]layout.Descriptor, error) {
+	return f.referrers[digest], nil
+}
+
+// sign attaches a new artifact to subject through the referrers API, the way
+// notation does, and returns it.
+func (f *fakeRepository) sign(t *testing.T, subject *source.Manifest, content string) *source.Manifest {
+	t.Helper()
+
+	config := layout.Descriptor{
+		MediaType: "application/vnd.oci.empty.v1+json",
+		Digest:    digestOf([]byte("{}")),
+		Size:      2,
+	}
+	f.blobs[config.Digest] = []byte("{}")
+	layer := f.blob(content)
+
+	raw, err := json.Marshal(layout.Manifest{
+		SchemaVersion: 2,
+		MediaType:     "application/vnd.oci.image.manifest.v1+json",
+		ArtifactType:  "application/vnd.cncf.notary.signature",
+		Config:        &config,
+		Layers:        []layout.Descriptor{layer},
+		Subject: &layout.Descriptor{
+			MediaType: subject.MediaType,
+			Digest:    subject.Digest,
+			Size:      subject.Size,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal signature: %v", err)
+	}
+	parsed, err := layout.ParseManifest(raw)
+	if err != nil {
+		t.Fatalf("parse signature: %v", err)
+	}
+
+	m := &source.Manifest{
+		Digest:    digestOf(raw),
+		MediaType: "application/vnd.oci.image.manifest.v1+json",
+		Size:      int64(len(raw)),
+		Raw:       raw,
+		Parsed:    parsed,
+	}
+	f.byDigest[m.Digest] = m
+	if f.referrers == nil {
+		f.referrers = map[string][]layout.Descriptor{}
+	}
+	f.referrers[subject.Digest] = append(f.referrers[subject.Digest], *parsed.ReferrerDescriptor(m.Digest, m.Size))
+
+	return m
 }
 
 // tag points tag at a new image whose layer holds content.
@@ -303,6 +353,113 @@ func TestAMovedTagIsCopiedAgain(t *testing.T) {
 		t.Fatalf("the tag object records %s, want %s", got, moved.Digest)
 	}
 
+}
+
+// A signature added in the source after the image was mirrored does not move
+// the tag, so by default it never comes across: that is the price of deciding
+// from the tag object alone, and this pins it so that paying it is a choice.
+func TestALateSignatureIsNotCopiedByDefault(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.2")
+
+	store := blobstore.NewMemory()
+	newMirror := func() *mirror.Mirror {
+		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist"}
+	}
+
+	run(t, newMirror())
+	subject := repo.byTag["1.4.2"]
+	signature := repo.sign(t, subject, "a-late-signature")
+
+	result := run(t, newMirror())
+	if result.Copied != 0 {
+		t.Fatalf("copied %d tags, want 0", result.Copied)
+	}
+	if _, ok := store.Body(layout.ReferrerKey("dist/perception", subject.Digest, signature.Digest)); ok {
+		t.Fatal("the late signature came across without --recheck-attachments")
+	}
+}
+
+func TestRecheckAttachmentsCopiesALateSignature(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.2")
+
+	store := blobstore.NewMemory()
+	newMirror := func() *mirror.Mirror {
+		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", RecheckAttachments: true}
+	}
+
+	run(t, newMirror())
+	subject := repo.byTag["1.4.2"]
+	signature := repo.sign(t, subject, "a-late-signature")
+
+	result := run(t, newMirror())
+	if result.Copied != 1 {
+		t.Fatalf("copied %d tags after a signature was added, want 1", result.Copied)
+	}
+	if _, ok := store.Body(layout.ReferrerKey("dist/perception", subject.Digest, signature.Digest)); !ok {
+		t.Fatal("the late signature's referrer descriptor is not in the bucket")
+	}
+	if _, ok := store.Body(layout.ManifestKey("dist/perception", signature.Digest)); !ok {
+		t.Fatal("the late signature's manifest is not in the bucket")
+	}
+
+	// And once it is there, the image is published whole: the next run
+	// writes nothing.
+	writes := len(store.Writes)
+	result = run(t, newMirror())
+	if result.Copied != 0 || result.Skipped != 1 {
+		t.Fatalf("the run after copied %d and skipped %d, want 0 and 1", result.Copied, result.Skipped)
+	}
+	if got := len(store.Writes); got != writes {
+		t.Fatalf("the run after wrote %d objects, want none", got-writes)
+	}
+}
+
+// cosign v2 attaches by a tag named after the subject, which the walk skips
+// as a tag of its own; a late one has to be found from below the subject.
+func TestRecheckAttachmentsCopiesALateCosignTag(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.2")
+
+	store := blobstore.NewMemory()
+	newMirror := func() *mirror.Mirror {
+		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", RecheckAttachments: true}
+	}
+
+	run(t, newMirror())
+	signature := strings.Replace(repo.byTag["1.4.2"].Digest, ":", "-", 1) + ".sig"
+	repo.tag(t, signature, "a-late-signature")
+
+	result := run(t, newMirror())
+	if result.Copied != 1 {
+		t.Fatalf("copied %d tags after a cosign tag was added, want 1", result.Copied)
+	}
+	if _, ok := store.Body("dist/perception/manifests/" + signature); !ok {
+		t.Fatal("the late cosign tag is not in the bucket")
+	}
+}
+
+func TestRecheckAttachmentsDoesNothingWithNoReferrers(t *testing.T) {
+	registry := newFakeRegistry()
+	repo := registry.repository(t, "dist/perception", "1.4.2")
+
+	store := blobstore.NewMemory()
+	newMirror := func() *mirror.Mirror {
+		return &mirror.Mirror{Registry: registry, Store: store, Bucket: "registry-test", Prefix: "dist", RecheckAttachments: true, NoReferrers: true}
+	}
+
+	run(t, newMirror())
+	repo.sign(t, repo.byTag["1.4.2"], "a-late-signature")
+	fetches := repo.fetches.Load()
+
+	result := run(t, newMirror())
+	if result.Copied != 0 {
+		t.Fatalf("copied %d tags, want 0", result.Copied)
+	}
+	if got := repo.fetches.Load(); got != fetches {
+		t.Fatalf("fetched %d manifests, want none: there is nothing to recheck without referrers", got-fetches)
+	}
 }
 
 func TestAttachmentTagsAreNotMirroredOnTheirOwn(t *testing.T) {

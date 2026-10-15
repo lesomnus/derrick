@@ -419,3 +419,35 @@ func rate(n int64, d time.Duration) string {
 
 	return HumanBytes(int64(float64(n)/d.Seconds())) + "/s"
 }
+
+// Unpublished counts the attachments in plan the store does not have: referrer
+// descriptors that are missing, and attachment tags that are missing or name a
+// different manifest. The tag being published, which is last, is not counted;
+// whether it is published is the caller's question, and already answered.
+//
+// It is what tells an image that was published before something was attached
+// to it from one that is published whole. The tag object cannot: it does not
+// change when a signature is added in the source.
+func (c *Copier) Unpublished(ctx context.Context, plan *Plan) (int, error) {
+	missing := 0
+	for _, referrer := range plan.Referrers {
+		obj, err := c.Store.Stat(ctx, layout.ReferrerKey(c.Repository, referrer.Subject, referrer.Digest))
+		if err != nil {
+			return 0, err
+		}
+		if obj == nil {
+			missing++
+		}
+	}
+	for _, t := range plan.Tags[:max(len(plan.Tags)-1, 0)] {
+		obj, err := c.Store.Stat(ctx, layout.ManifestKey(c.Repository, t.Name))
+		if err != nil {
+			return 0, err
+		}
+		if obj == nil || obj.Metadata[layout.DigestMetadataKey] != t.Manifest.Digest {
+			missing++
+		}
+	}
+
+	return missing, nil
+}
