@@ -408,6 +408,7 @@ func runMirror(ctx context.Context, args []string) error {
 		prune        = fs.Bool("prune", false, "remove destination tags the source no longer has")
 		dryRun       = fs.Bool("dry-run", false, "report what would be copied without writing it")
 		noReferrers  = fs.Bool("no-referrers", false, "skip signatures, attestations and SBOMs")
+		recheck      = fs.Bool("recheck-attachments", false, "copy a published tag again if the bucket lacks an attachment the source has")
 		doVerify     = fs.Bool("verify", false, "re-read every object after writing it")
 		cosignTags   = fs.String("cosign-tags", copier.CosignTagsRoot, `how hard to look for cosign's fallback tags: "root", "all" or "none"`)
 		insecure     = fs.Bool("src-insecure", false, "allow a plain-http source registry")
@@ -461,6 +462,7 @@ func runMirror(ctx context.Context, args []string) error {
 		Concurrency:         store.concurrency,
 		DryRun:              *dryRun,
 		NoReferrers:         *noReferrers,
+		RecheckAttachments:  *recheck,
 		CosignTags:          *cosignTags,
 		Verify:              *doVerify,
 		Log:                 log,

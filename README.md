@@ -159,6 +159,7 @@ destination is a bucket and not a reference — there is nothing else to say.
 | `--exclude-repository` | `path.Match` pattern not to mirror; repeatable |
 | `--exclude-tag` | same, for tags |
 | `--prune` | remove destination tags the source no longer has |
+| `--recheck-attachments` | copy a published tag again if the bucket lacks an attachment the source has; see below |
 
 plus everything `copy` takes.
 
@@ -198,6 +199,26 @@ What that costs is one bucket `HEAD` per tag per run: at ten thousand tags,
 well inside what an object store gives away, and a second or two of wall clock
 at any sane parallelism. The request that cannot be avoided either way is the
 one against the source, and it is the expensive one.
+
+### What that misses: an attachment added later
+
+The tag object records the digest it was published at, and a signature added
+in the source afterwards does not change that digest. So an image mirrored
+before it was signed stays unsigned in the bucket, run after run, with every
+run reporting it present. Nothing is wrong with the check; it answers the
+question it asks, and this is a different one.
+
+`--recheck-attachments` asks it. For a tag that is already published, it walks
+the image in the source — the manifests, and the referrers of each — and asks
+the bucket for every referrer descriptor and attachment tag it finds. If any is
+missing, the tag is copied again, which skips by `HEAD` everything already
+there and writes what is not. If none is, the tag is skipped as before.
+
+That is the walk the default exists to avoid: a manifest fetch and a referrers
+query per manifest in the source, and a bucket `HEAD` per attachment, for
+every tag on every run. It is off by default for that reason, and on for a
+bucket whose readers refuse what is unsigned — where an image that lost its
+signature on the way is an image that does not run.
 
 Every tag is said out loud either way — copied, already present at a digest,
 attached to something else, or excluded by a pattern. A run that copies nothing

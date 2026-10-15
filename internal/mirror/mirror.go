@@ -110,6 +110,18 @@ type Mirror struct {
 	CosignTags  string
 	Verify      bool
 
+	// RecheckAttachments looks below a tag that is already published for
+	// attachments the bucket does not have, and copies the image again if
+	// there are any.
+	//
+	// A signature added in the source after the image was mirrored does not
+	// move the tag, so the tag object alone says the image is published and
+	// it stays unsigned in the bucket for good. Asking costs walking the
+	// image in the source and one bucket HEAD per attachment, for every tag,
+	// on every run: what the default does not pay, and what a fleet that
+	// refuses unsigned images has to.
+	RecheckAttachments bool
+
 	// Log is called from several goroutines at once, for the same reason
 	// copier.Logger is, and with the tags of one repository in flight on top
 	// of that. Everything this package writes goes through say or emit, which
@@ -422,7 +434,8 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 	if err != nil {
 		return outcome{err: err}
 	}
-	if published {
+	recheck := published && m.RecheckAttachments && !m.NoReferrers
+	if published && !recheck {
 		// Said out loud, and not only counted. A run that copies nothing
 		// should account for every tag it decided not to copy, or the log of
 		// a steady-state run says only that the mirror ran.
@@ -451,6 +464,28 @@ func (m *Mirror) mirrorTag(ctx context.Context, repo Repository, repository, tag
 		CosignTags:  m.CosignTags,
 		Verify:      m.Verify,
 		Log:         body.Log,
+	}
+
+	if recheck {
+		// Planned twice when something is missing, since Run plans for
+		// itself. The second plan is of a graph just fetched, and the copy
+		// it drives skips by HEAD everything the bucket already has, so what
+		// that costs is requests and not bytes.
+		plan, err := c.Plan(ctx, root, tag)
+		if err != nil {
+			return outcome{err: err}
+		}
+		missing, err := c.Unpublished(ctx, plan)
+		if err != nil {
+			return outcome{err: err}
+		}
+		if missing == 0 {
+			m.say("%s:%s present at %s, with its %d attachments", repository, tag, digest, len(plan.Referrers))
+
+			return outcome{}
+		}
+
+		body.Log("present at %s, but %d attachments are not", digest, missing)
 	}
 
 	start := time.Now()
