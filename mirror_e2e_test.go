@@ -2,7 +2,13 @@ package main_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
+
+	"github.com/google/go-containerregistry/pkg/registry"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -137,5 +143,45 @@ func TestMirrorSkipsWhatItAlreadyCopied(t *testing.T) {
 	}
 	if got := len(store.Writes); got != writes {
 		t.Errorf("the second run wrote %d objects, want none", got-writes)
+	}
+}
+
+// A mirror asks the source a handful of questions per tag. Each one used to
+// open a client of its own, and a client starts by pinging the registry and,
+// behind token auth, fetching a token: three requests for every one that was
+// needed, tens of thousands a run against the real source. The ping is what
+// starts that exchange, so counting pings counts authentications.
+func TestMirrorAuthenticatesOncePerRepository(t *testing.T) {
+	var pings atomic.Int64
+	handler := registry.New(registry.Logger(newTestLogger(t)))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" || r.URL.Path == "/v2" {
+			pings.Add(1)
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse server url: %v", err)
+	}
+	host := u.Host
+
+	for _, tag := range []string{"1.4.0", "1.4.1", "1.4.2"} {
+		pushTo(t, host, "dist/perception", tag)
+	}
+	pushTo(t, host, "dist/control", "2.0.0")
+	pushTo(t, host, "dist/control", "2.0.1")
+	pings.Store(0)
+
+	result := mirrorRegistry(t, host, blobstore.NewMemory())
+	if result.Copied != 5 {
+		t.Fatalf("copied %d tags, want 5", result.Copied)
+	}
+
+	// One for the catalog, one for each repository.
+	if got := pings.Load(); got > 3 {
+		t.Errorf("the mirror pinged the registry %d times, want at most 3", got)
 	}
 }
