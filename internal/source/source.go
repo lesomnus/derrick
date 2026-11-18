@@ -43,14 +43,26 @@ func (o Options) nameOptions() []name.Option {
 	return nil
 }
 
-func (o Options) remoteOptions() []remote.Option {
-	if o.Auth != nil {
-		return []remote.Option{remote.WithAuth(o.Auth)}
+func (o Options) remoteOptions() ([]remote.Option, error) {
+	auth := remote.WithAuth(o.Auth)
+	if o.Auth == nil {
+		// The docker config the operator already logged in with. A publisher
+		// runs where builds run, so those credentials are usually right there.
+		auth = remote.WithAuthFromKeychain(authn.DefaultKeychain)
 	}
 
-	// The docker config the operator already logged in with. A publisher runs
-	// where builds run, so those credentials are usually right there.
-	return []remote.Option{remote.WithAuthFromKeychain(authn.DefaultKeychain)}
+	// Every request through one puller. Without it each call pings the
+	// registry and fetches a token of its own before asking its question: a
+	// mirror of a few hundred tags made three requests for every one it
+	// needed, and a registry behind token auth saw tens of thousands of token
+	// requests in under a minute. The puller authenticates once per repository
+	// and keeps the transport, which also keeps the connection.
+	puller, err := remote.NewPuller(auth)
+	if err != nil {
+		return nil, fmt.Errorf("prepare registry client: %w", err)
+	}
+
+	return []remote.Option{auth, remote.Reuse(puller)}, nil
 }
 
 // Source is one repository in a remote registry.
@@ -68,7 +80,12 @@ func Open(ctx context.Context, reference string, o Options) (*Source, *Manifest,
 		return nil, nil, fmt.Errorf("parse %q: %w", reference, err)
 	}
 
-	s := &Source{repo: ref.Context(), insecure: o.Insecure, opts: o.remoteOptions()}
+	opts, err := o.remoteOptions()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s := &Source{repo: ref.Context(), insecure: o.Insecure, opts: opts}
 
 	desc, err := remote.Get(ref, s.withContext(ctx)...)
 	if err != nil {

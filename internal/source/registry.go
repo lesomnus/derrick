@@ -17,6 +17,10 @@ import (
 type Registry struct {
 	registry name.Registry
 	opts     Options
+
+	// Shared by the registry and every repository opened from it, so that
+	// what it learned authenticating is not thrown away between requests.
+	remote []remote.Option
 }
 
 // OpenRegistry prepares registry, which is a host and optionally a port.
@@ -26,7 +30,12 @@ func OpenRegistry(registry string, o Options) (*Registry, error) {
 		return nil, fmt.Errorf("parse registry %q: %w", registry, err)
 	}
 
-	return &Registry{registry: reg, opts: o}, nil
+	opts, err := o.remoteOptions()
+	if err != nil {
+		return nil, err
+	}
+
+	return &Registry{registry: reg, opts: o, remote: opts}, nil
 }
 
 // Name is the registry host, for logging.
@@ -42,7 +51,7 @@ func (r *Registry) Name() string {
 // endpoint at all. That is worth knowing about a mirror: it copies what it was
 // shown, and being shown nothing looks exactly like there being nothing.
 func (r *Registry) Catalog(ctx context.Context) ([]string, error) {
-	repositories, err := remote.Catalog(ctx, r.registry, r.opts.remoteOptions()...)
+	repositories, err := remote.Catalog(ctx, r.registry, r.remote...)
 	if err != nil {
 		return nil, fmt.Errorf("catalog %s: %w", r.Name(), err)
 	}
@@ -58,7 +67,7 @@ func (r *Registry) Repository(_ context.Context, repository string) (*Source, er
 		return nil, fmt.Errorf("parse repository %q: %w", repository, err)
 	}
 
-	return &Source{repo: repo, insecure: r.opts.Insecure, opts: r.opts.remoteOptions()}, nil
+	return &Source{repo: repo, insecure: r.opts.Insecure, opts: r.remote}, nil
 }
 
 // Tags lists the tags in this repository.
